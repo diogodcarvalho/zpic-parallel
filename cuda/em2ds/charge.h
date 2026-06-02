@@ -33,16 +33,16 @@ class Charge {
     /// @brief Iteration number
     int iter;
 
-    /// @brief FFT plan
-    fft::plan  * fft_forward;
-
     /**
      * @brief Process boundary conditions
-     * 
+     *
      */
     void process_bc();
 
     public:
+
+    /// @brief FFT plan
+    fft::plan  * fft_forward;
 
     /// @brief Charge density
     grid<float> * rho;
@@ -136,11 +136,17 @@ class Charge {
 
     /**
      * @brief Advance charge
-     * 
+     *
      * @note This will i) update tile edge values, ii) add neutral background,
-     *       iii) Fourier transform and iv) filter 
+     *       iii) Fourier transform and iv) filter
      */
     void advance();
+
+    /**
+     * @brief Reset iteration counter to zero
+     *
+     */
+    void reset_iter() { iter = 0; }
 
     /**
      * @brief Zero charge density values

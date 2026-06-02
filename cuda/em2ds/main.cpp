@@ -4,6 +4,8 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <cstdio>
+#include <cstdlib>
 
 #include "gpu.h"
 #include "utils.h"
@@ -337,6 +339,141 @@ void test_weibel( ) {
               << ", Performance: " << perf << " GPart/s\n";
 }
 
+
+void test_sparse( std::string param ) {
+
+    std::cout << ansi::bold
+              << "Running " << __func__ << "()..."
+              << ansi::reset << std::endl;
+
+    // Default parameters.
+    // Override any of them via -p "key=value ..." pairs,
+    uint2  ntiles { 1, 1 };
+    uint2  nx     { 32, 32 };
+    float  dx      = 0.001f;             // cell size (same in x and y)
+    float  dx_part = 0.032f;             // sparse density spacing (same in x and y)
+    uint2  spacing{ 0, 0 };              // lattice spacing in cells (overrides dx_part if set)
+    float  dt      = 0.000692965f;       // time step
+    uint  n_dump  = 100;                // diagnostic output interval (in number of timesteps)
+    float  tmax    = 0.002f;             // total simulation time
+    float3 uth    { 0.0f, 0.0f, 0.0f };  // thermal velocity
+    float3 ufl    { 0.1f, 0.0f, 0.0f };  // fluid velocity
+    
+    // Parse whitespace-separated "key=value" pairs. 
+    // Vector values are comma-separated, e.g. "ntiles=4,4" or "uth=0.1,0,0".
+    std::istringstream tokens( param );
+    std::string tok;
+    while ( tokens >> tok ) {
+        auto eq = tok.find('=');
+        if ( eq == std::string::npos ) {
+            std::cerr << "Invalid parameter (expected key=value): '" << tok << "'\n";
+            std::exit(1);
+        }
+        std::string key = tok.substr( 0, eq );
+        std::string val = tok.substr( eq + 1 );
+
+        int got, want;
+        if      ( key == "ntiles"  ) { got = std::sscanf( val.c_str(), "%u,%u",    &ntiles.x, &ntiles.y );   want = 2; }
+        else if ( key == "nx"      ) { got = std::sscanf( val.c_str(), "%u,%u",    &nx.x, &nx.y );           want = 2; }
+        else if ( key == "dx"      ) { got = std::sscanf( val.c_str(), "%f",       &dx );                    want = 1; }
+        else if ( key == "dt"      ) { got = std::sscanf( val.c_str(), "%f",       &dt );                    want = 1; }
+        else if ( key == "uth"     ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &uth.x, &uth.y, &uth.z ); want = 3; }
+        else if ( key == "ufl"     ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &ufl.x, &ufl.y, &ufl.z ); want = 3; }
+        else if ( key == "n_dump"  ) { got = std::sscanf( val.c_str(), "%u",       &n_dump );                want = 1; }
+        else if ( key == "tmax"    ) { got = std::sscanf( val.c_str(), "%f",       &tmax );                  want = 1; }
+        else if ( key == "dx_part" ) { got = std::sscanf( val.c_str(), "%f",       &dx_part );               want = 1; }
+        else if ( key == "spacing" ) { got = std::sscanf( val.c_str(), "%u,%u",    &spacing.x, &spacing.y ); want = 2; }
+        else {
+            std::cerr << "Unknown parameter key: '" << key << "'\n";
+            std::exit(1);
+        }
+        if ( got != want ) {
+            std::cerr << "Invalid value for '" << key << "': '" << val << "'\n";
+            std::exit(1);
+        }
+    }
+
+    float2 box = dx * make_float2( ntiles.x * nx.x, ntiles.y * nx.y );
+
+    std::cout << "ntiles    : " << ntiles  << '\n';
+    std::cout << "nx (tile) : " << nx      << '\n';
+    std::cout << "dx        : " << dx      << '\n';
+    std::cout << "box       : " << box     << '\n';
+    if ( spacing.x > 0 && spacing.y > 0 )
+        std::cout << "spacing   : " << spacing << '\n';
+    else
+        std::cout << "dx_part   : " << dx_part << '\n';
+    std::cout << "dt        : " << dt      << '\n';
+    std::cout << "n_dump    : " << n_dump  << '\n';
+    std::cout << "tmax      : " << tmax    << '\n';
+    std::cout << "uth       : " << uth     << '\n';
+    std::cout << "ufl       : " << ufl     << '\n';
+    
+    Simulation sim( ntiles, nx, box, dt );
+
+    uint2 ppc{ 1, 1 };
+
+    Species electrons("electrons", -1.0f, ppc);
+    if ( spacing.x > 0 && spacing.y > 0 )
+        electrons.set_density(
+            Density::Lattice(1.0, spacing)
+        );
+    else
+        electrons.set_density(
+            Density::Sparse(1.0, float2{ dx_part, dx_part })
+        );
+    electrons.set_udist(
+        UDistribution::ThermalCorr( uth, ufl )
+    );
+
+    sim.add_species( electrons );
+
+    // Initialize fields via Poisson solve from initial charge density
+    sim.init_fields( emf::init_type::poisson );
+
+    // Lambda function for diagnostic output
+    auto diag = [ & ]( ) {
+        // sim.emf.save(emf::e, fcomp::x);
+        // sim.emf.save(emf::e, fcomp::y);
+        // sim.emf.save(emf::e, fcomp::z);
+
+        // sim.emf.save(emf::b, fcomp::x);
+        // sim.emf.save(emf::b, fcomp::y);
+        // sim.emf.save(emf::b, fcomp::z);
+
+        // sim.current.save(fcomp::x);
+        // sim.current.save(fcomp::y);
+        // sim.current.save(fcomp::z);
+
+        // sim.charge.save();
+        // electrons.save_charge();
+
+        electrons.save();
+        sim.energy_info();
+    };
+
+    Timer timer; timer.start();
+
+    diag();
+
+    while ( sim.get_t() <= tmax ) {
+        sim.advance();
+        if ( sim.get_iter() % n_dump == 0 ) {
+            diag();
+        }
+    }
+    timer.stop();
+
+    std::cout << ansi::bold
+              << "Done!\n"
+              << ansi::reset;
+
+    auto perf = sim.get_nmove() / timer.elapsed(timer::s) / 1.e9;
+
+    std::cerr << "Elapsed time: " << timer.elapsed(timer::s) << " s"
+              << ", Performance: " << perf << " GPart/s\n";
+}
+
 /**
  * @brief Initialize GPU device
  * 
@@ -386,7 +523,7 @@ int main( int argc, char *argv[] ) {
     int opt;
     int silent = 0;
     std::string test = "weibel";
-    std::string param = "16,16";
+    std::string param = "";
     while ((opt = getopt(argc, argv, "ht:p:s")) != -1) {
         switch (opt) {
             case 't':
@@ -413,7 +550,7 @@ int main( int argc, char *argv[] ) {
 
     // test_grid();
     // test_laser();
-    
     // test_mov();
-    test_weibel();
+    // test_weibel();
+    test_sparse( param );
 }

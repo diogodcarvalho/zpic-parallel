@@ -21,6 +21,10 @@ namespace emf {
     }
 
     typedef bnd<bc::type> bc_type;
+
+    namespace init_type {
+        enum type { none = 0, poisson };
+    }
 }
 
 class EMF {
@@ -105,10 +109,16 @@ class EMF {
 
     /**
      * @brief Get the iter value
-     * 
-     * @return auto 
+     *
+     * @return auto
      */
     int get_iter() { return iter; }
+
+    /**
+     * @brief Reset iteration counter to zero
+     *
+     */
+    void reset_iter() { iter = 0; }
 
     /**
      * @brief Get the boundary conditions
@@ -154,6 +164,15 @@ class EMF {
         E -> periodic.x = B->periodic.x = ( bc.x.lower == emf::bc::periodic );
         E -> periodic.y = B->periodic.y = ( bc.y.lower == emf::bc::periodic );
     }
+
+    /**
+     * @brief Set EM fields at t=0
+     *
+     * @param type
+     * @param charge
+     */
+    void set_init_fields( emf::init_type::type type, Charge & charge );
+
 
     void advance( );
     void advance( Current & current, Charge & charge );

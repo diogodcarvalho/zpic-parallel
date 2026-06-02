@@ -945,3 +945,355 @@ void Density::Sphere::np_inject( Particles & particles,
         range, sphere_center, radius, dx, ppc, particles, np
     );
 }
+
+namespace kernel {
+
+__global__
+void sparse( 
+    bnd<unsigned int> range,
+    float2 dx_particles, float2 dx,
+    ParticleData const part )
+{
+    // Tile ID
+    const int2 tile_idx = make_int2( blockIdx.x, blockIdx.y );
+    const int tile_id = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    // Number of particles already in the tile (injection appends after these)
+    const int np_tile = part.np[ tile_id ];
+
+    // Find injection range in tile coordinates
+    const int2 nx = make_int2( part.nx.x, part.nx.y );
+
+    int ri0 = range.x.lower - tile_idx.x * nx.x;
+    int ri1 = range.x.upper - tile_idx.x * nx.x;
+
+    int rj0 = range.y.lower - tile_idx.y * nx.y;
+    int rj1 = range.y.upper - tile_idx.y * nx.y;
+
+    // If range overlaps with tile
+    if (( ri0 < nx.x ) && ( ri1 >= 0 ) &&
+        ( rj0 < nx.y ) && ( rj1 >= 0 )) {
+
+        // Limit to range inside this tile
+        if (ri0 < 0) ri0 = 0;
+        if (rj0 < 0) rj0 = 0;
+        if (ri1 >= nx.x ) ri1 = nx.x-1;
+        if (rj1 >= nx.y ) rj1 = nx.y-1;
+
+        const int offset =  part.offset[ tile_id ];
+        int2   * __restrict__ ix = &part.ix[ offset ];
+        float2 * __restrict__ x  = &part.x[ offset ];
+        float3 * __restrict__ u  = &part.u[ offset ];
+
+        // Cell index shift for this tile with respect to global (0,0)
+        const int shiftx = tile_idx.x * nx.x;
+        const int shifty = tile_idx.y * nx.y;
+
+        // Distance between macroparticles in units of gridcell
+        const float dpcx = dx_particles.x / dx.x;
+        const float dpcy = dx_particles.y / dx.y;
+
+        // Global index of the first macroparticle at or after each tile left edge.
+        // Equivalent to ceil( left-tile-edge / spacing ).
+        int npx0 = ( shiftx + ri0 ) / dpcx;
+        int npy0 = ( shifty + rj0 ) / dpcy; 
+        npx0 += ( npx0 * dpcx < shiftx + ri0 );
+        npy0 += ( npy0 * dpcy < shifty + rj0     );
+        // Global index of the first macroparticle at or after each tile right edge.
+        int npx1 = ( shiftx + ri1 + 1 ) / dpcx;
+        int npy1 = ( shifty + rj1 + 1 ) / dpcy; 
+        npx1 += ( npx1 * dpcx < shiftx + ri1 + 1 );
+        npy1 += ( npy1 * dpcy < shifty + rj1 + 1 );
+
+        // Number of particles to inject in this tile (exact)
+        const int npxmax = npx1 - npx0;
+        const int npymax = npy1 - npy0;
+        const int npmax  = npxmax * npymax;
+
+        // Threads loop over particles to place. The count is exact, so the write
+        // index is simply np_tile + idx (no stream compaction needed).
+        for( int idx = block_thread_rank(); idx < npmax; idx += block_num_threads() ) {
+            // (x,y) global index of selected particle
+            const int npx = npx0 + idx % npxmax;
+            const int npy = npy0 + idx / npxmax;
+
+            // position in units of grid cell inside the tile
+            float i = npx * dpcx - shiftx;
+            float j = npy * dpcy - shifty;
+
+            int2 cell = make_int2( (int) i, (int) j );
+            if ( cell.x >= nx.x ) cell.x = nx.x - 1;
+            if ( cell.y >= nx.y ) cell.y = nx.y - 1;
+
+            const int k = np_tile + idx;
+            ix[ k ] = cell;
+            x[ k ]  = make_float2( i - cell.x - 0.5f, j - cell.y - 0.5f );
+            u[ k ]  = make_float3( 0, 0, 0 );
+        }
+
+        if ( block_thread_rank() == 0 ) {
+            part.np[ tile_id ] = np_tile + npmax;
+        }
+    }
+}
+
+}
+
+void Density::Sparse::inject( Particles & particles,
+    uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range ) const
+{
+    dim3 grid( particles.ntiles.x, particles.ntiles.y );
+    dim3 block( 1024 );
+
+    if ( ppc.x != 1 || ppc.y != 1 )
+        std::cout << "(*info*) ppc is ignored for sparse density" << std::endl;
+
+    kernel::sparse <<< grid, block >>> (
+        range, dx_particles, dx, particles
+    );
+
+    // Capture the injection count so norm_charge() can attribute the correct charge to 
+    // each macroparticle (q = n0 * inj_ncells / inj_ncells).
+    inj_ncells = ( unsigned long ) ( range.x.upper - range.x.lower + 1 ) *
+                 ( range.y.upper - range.y.lower + 1 );
+    inj_np = particles.np_total();
+}
+
+namespace kernel {
+
+__global__
+void sparse_np(
+    bnd<unsigned int> range,
+    float2 dx_particles, float2 dx,
+    ParticleData const part, int * np )
+{
+    // Tile ID - 1 thread per tile (returns immediately for excess threads)
+    const int tile_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( tile_id >= part.ntiles.x * part.ntiles.y ) return;
+
+    const int2 tile_idx = make_int2(
+        tile_id % part.ntiles.x,
+        tile_id / part.ntiles.x
+    );
+
+    // Find injection range in tile coordinates
+    const int2 nx = make_int2( part.nx.x, part.nx.y );
+
+    int ri0 = range.x.lower - tile_idx.x * nx.x;
+    int ri1 = range.x.upper - tile_idx.x * nx.x;
+
+    int rj0 = range.y.lower - tile_idx.y * nx.y;
+    int rj1 = range.y.upper - tile_idx.y * nx.y;
+
+    int inj_np = 0;
+
+    // If range overlaps with tile
+    if (( ri0 < nx.x ) && ( ri1 >= 0 ) &&
+        ( rj0 < nx.y ) && ( rj1 >= 0 )) {
+
+        // Limit to range inside this tile
+        if (ri0 < 0) ri0 = 0;
+        if (rj0 < 0) rj0 = 0;
+        if (ri1 >= nx.x ) ri1 = nx.x-1;
+        if (rj1 >= nx.y ) rj1 = nx.y-1;
+
+        // Cell index shift for this tile with respect to global (0,0)
+        const int shiftx = tile_idx.x * nx.x;
+        const int shifty = tile_idx.y * nx.y;
+
+        // Distance between macroparticles in units of gridcell
+        const float dpcx = dx_particles.x / dx.x;
+        const float dpcy = dx_particles.y / dx.y;
+
+        // Global index of the first macroparticle at or after each tile left edge.
+        // Equivalent to ceil( left-tile-edge / spacing ).
+        int npx0 = ( shiftx + ri0 ) / dpcx;
+        int npy0 = ( shifty + rj0 ) / dpcy; 
+        npx0 += ( npx0 * dpcx < shiftx + ri0 );
+        npy0 += ( npy0 * dpcy < shifty + rj0     );
+        // Global index of the first macroparticle at or after each tile right edge.
+        int npx1 = ( shiftx + ri1 + 1 ) / dpcx;
+        int npy1 = ( shifty + rj1 + 1 ) / dpcy; 
+        npx1 += ( npx1 * dpcx < shiftx + ri1 + 1 );
+        npy1 += ( npy1 * dpcy < shifty + rj1 + 1 );
+        
+        inj_np = ( npx1 - npx0 ) * ( npy1 - npy0 );
+    }
+
+    np[ tile_id ] = inj_np;
+}
+
+}
+
+void Density::Sparse::np_inject( Particles & particles, 
+    uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range,
+    int * np ) const
+{
+    const int ntiles = particles.ntiles.x * particles.ntiles.y;
+
+    // Only need one thread per tile since the count is exact.
+    // Extra threads will be ignored by the kernel.
+    int block = ( ntiles > 1024 ) ? 1024 : ntiles;
+    int grid  = ( ntiles - 1 ) / block + 1;
+
+    kernel::sparse_np <<< grid, block >>> ( range, dx_particles, dx, particles, np );
+}
+
+namespace kernel {
+
+__global__
+void lattice(
+    bnd<unsigned int> range,
+    uint2 spacing,
+    ParticleData const part )
+{
+    // Tile ID
+    const int2 tile_idx = make_int2( blockIdx.x, blockIdx.y );
+    const int tile_id = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    // Number of particles already in the tile (injection appends after these)
+    const int np_tile = part.np[ tile_id ];
+
+    // Find injection range in tile coordinates
+    const int2 nx = make_int2( part.nx.x, part.nx.y );
+
+    int ri0 = range.x.lower - tile_idx.x * nx.x;
+    int ri1 = range.x.upper - tile_idx.x * nx.x;
+
+    int rj0 = range.y.lower - tile_idx.y * nx.y;
+    int rj1 = range.y.upper - tile_idx.y * nx.y;
+
+    // If range overlaps with tile
+    if (( ri0 < nx.x ) && ( ri1 >= 0 ) &&
+        ( rj0 < nx.y ) && ( rj1 >= 0 )) {
+
+        // Limit to range inside this tile
+        if (ri0 < 0) ri0 = 0;
+        if (rj0 < 0) rj0 = 0;
+        if (ri1 >= nx.x ) ri1 = nx.x-1;
+        if (rj1 >= nx.y ) rj1 = nx.y-1;
+
+        const int offset =  part.offset[ tile_id ];
+        int2   * __restrict__ ix = &part.ix[ offset ];
+        float2 * __restrict__ x  = &part.x[ offset ];
+        float3 * __restrict__ u  = &part.u[ offset ];
+
+        // Cell shift of this tile w.r.t. the global grid
+        const int shiftx = tile_idx.x * nx.x;
+        const int shifty = tile_idx.y * nx.y;
+
+        // Get index of first and last lattice point in this tile's range.
+        // Operation is equivalent px = ceil( edge / spacing ) 
+        const int px0 = ( shiftx + ri0     + spacing.x - 1 ) / spacing.x;
+        const int px1 = ( shiftx + ri1 + 1 + spacing.x - 1 ) / spacing.x;
+        const int py0 = ( shifty + rj0     + spacing.y - 1 ) / spacing.y;
+        const int py1 = ( shifty + rj1 + 1 + spacing.y - 1 ) / spacing.y;
+
+        // Number of particles to inject in this tile (exact)
+        const int npx = px1 - px0;
+        const int npy = py1 - py0;
+        const int npmax  = npx * npy;
+
+        // Threads loop over particles to place. Each point lies on a cell corner.
+        for( int idx = block_thread_rank(); idx < npmax; idx += block_num_threads() ) {
+            const int px = px0 + idx % npx;
+            const int py = py0 + idx / npx;
+
+            const int k = np_tile + idx;
+            ix[ k ] = make_int2( px * spacing.x - shiftx, py * spacing.y - shifty );
+            x[ k ]  = make_float2( -0.5f, -0.5f );
+            u[ k ]  = make_float3( 0, 0, 0 );
+        }
+
+        if ( block_thread_rank() == 0 ) {
+            part.np[ tile_id ] = np_tile + npmax;
+        }
+    }
+}
+
+}
+
+void Density::Lattice::inject( Particles & particles,
+    uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range ) const
+{
+    dim3 grid( particles.ntiles.x, particles.ntiles.y );
+    dim3 block( 1024 );
+
+    kernel::lattice <<< grid, block >>> ( range, spacing, particles );
+
+    // Capture the injection count so norm_charge() can attribute the correct
+    // charge to each macroparticle (q = n0 * inj_ncells / inj_np).
+    inj_ncells = ( unsigned long ) ( range.x.upper - range.x.lower + 1 ) *
+                 ( range.y.upper - range.y.lower + 1 );
+    inj_np = particles.np_total();
+}
+
+namespace kernel {
+
+__global__
+void lattice_np(
+    bnd<unsigned int> range,
+    uint2 spacing,
+    ParticleData const part, int * np )
+{
+    // Tile ID - 1 thread per tile (returns immediately for excess threads)
+    const int tile_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( tile_id >= part.ntiles.x * part.ntiles.y ) return;
+
+    const int2 tile_idx = make_int2(
+        tile_id % part.ntiles.x,
+        tile_id / part.ntiles.x
+    );
+
+    // Find injection range in tile coordinates
+    const int2 nx = make_int2( part.nx.x, part.nx.y );
+
+    int ri0 = range.x.lower - tile_idx.x * nx.x;
+    int ri1 = range.x.upper - tile_idx.x * nx.x;
+
+    int rj0 = range.y.lower - tile_idx.y * nx.y;
+    int rj1 = range.y.upper - tile_idx.y * nx.y;
+
+    int inj_np = 0;
+
+    // If range overlaps with tile
+    if (( ri0 < nx.x ) && ( ri1 >= 0 ) &&
+        ( rj0 < nx.y ) && ( rj1 >= 0 )) {
+
+        // Limit to range inside this tile
+        if (ri0 < 0) ri0 = 0;
+        if (rj0 < 0) rj0 = 0;
+        if (ri1 >= nx.x ) ri1 = nx.x-1;
+        if (rj1 >= nx.y ) rj1 = nx.y-1;
+
+        // Lattice points sit on every spacing-th global cell; their count in this
+        // tile's range follows from ceil( edge / spacing ) at each edge.
+        const int shiftx = tile_idx.x * nx.x;
+        const int shifty = tile_idx.y * nx.y;
+
+        const int px0 = ( shiftx + ri0     + spacing.x - 1 ) / spacing.x;
+        const int px1 = ( shiftx + ri1 + 1 + spacing.x - 1 ) / spacing.x;
+        const int py0 = ( shifty + rj0     + spacing.y - 1 ) / spacing.y;
+        const int py1 = ( shifty + rj1 + 1 + spacing.y - 1 ) / spacing.y;
+
+        inj_np = ( px1 - px0 ) * ( py1 - py0 );
+    }
+
+    np[ tile_id ] = inj_np;
+}
+
+}
+
+void Density::Lattice::np_inject( Particles & particles,
+    uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range,
+    int * np ) const
+{
+    const int ntiles = particles.ntiles.x * particles.ntiles.y;
+
+    // Only need one thread per tile since the count is exact.
+    // Extra threads will be ignored by the kernel.
+    int block = ( ntiles > 1024 ) ? 1024 : ntiles;
+    int grid  = ( ntiles - 1 ) / block + 1;
+
+    kernel::lattice_np <<< grid, block >>> ( range, spacing, particles, np );
+}

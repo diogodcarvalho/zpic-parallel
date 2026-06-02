@@ -17,6 +17,12 @@ namespace Density {
 
         virtual Profile * clone() const = 0;
         
+        // Default normalization for charge deposition
+        // Can be overridden by specific profiles if needed (e.g., ppc < 1 case)
+        virtual float norm_charge( uint2 const ppc ) const {
+            return n0 / ( ppc.x * ppc.y );
+        }
+
         virtual void inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range ) const = 0;
     
         virtual void np_inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range, int * np ) const = 0;
@@ -124,6 +130,76 @@ namespace Density {
         Sphere * clone() const override { 
             return new Sphere(n0, center, radius);
         };
+
+        void inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range ) const override;
+        void np_inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range, int * np ) const override;
+    };
+
+    /**
+     * @brief Sparse plasma density
+     * 
+     * Equally-spaced macro-particles in a given 2D box region.
+     * 
+     */
+    class Sparse : public Profile {
+        public:
+
+        /// @brief  Distance between macroparticles in each direction (in  c/w_pe units)
+        const float2 dx_particles;
+
+        /// @brief Number of cells in the injection region (captured in inject)
+        mutable unsigned long inj_ncells = 0;
+
+        /// @brief Number of macroparticles actually injected (captured in inject)
+        mutable unsigned long inj_np = 0;
+
+        Sparse( float const n0, float2 dx_particles ) : Profile(n0), dx_particles(dx_particles) {};
+
+        Sparse * clone() const override {
+            return new Sparse(n0, dx_particles);
+        };
+
+        // Override norm_charge to account for the fact that the number of macroparticles
+        // injected is not tied to ppc, but rather to dx_particles.
+        float norm_charge( uint2 const ppc ) const override {
+            return ( inj_np > 0 ) ? n0 * double( inj_ncells ) / inj_np : 0;
+        }
+
+        void inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range ) const override;
+        void np_inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range, int * np ) const override;
+    };
+
+    /**
+     * @brief Lattice plasma density
+     *
+     * Regular lattice of macroparticles spaced by an integer number of grid cells
+     * in each direction.
+     *
+     */
+    class Lattice : public Profile {
+        public:
+
+        /// @brief Spacing between macroparticles in each direction (in grid cells)
+        const uint2 spacing;
+
+        /// @brief Number of cells in the injection region (captured in inject)
+        mutable unsigned long inj_ncells = 0;
+
+        /// @brief Number of macroparticles actually injected (captured in inject)
+        mutable unsigned long inj_np = 0;
+
+        Lattice( float const n0, uint2 spacing ) : Profile(n0), spacing(spacing) {};
+
+        Lattice * clone() const override {
+            return new Lattice(n0, spacing);
+        };
+
+        // Override norm_charge to account for the fact that the number of macroparticles
+        // injected is set by the lattice spacing, not by ppc.
+        float norm_charge( uint2 const ppc ) const override {
+            return ( inj_np > 0 ) ? n0 * double( inj_ncells ) / inj_np : 0;
+        }
+
         void inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range ) const override;
         void np_inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range, int * np ) const override;
     };

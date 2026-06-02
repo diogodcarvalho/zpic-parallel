@@ -1706,9 +1706,6 @@ void Species::initialize( float2 const box_, uint2 const ntiles, uint2 const nx,
     // Store species id (used by RNG)
     id = id_;
 
-    // Set charge normalization factor
-    q = copysign( density->n0 , m_q ) / (ppc.x * ppc.y);
-    
     float2 gnx = make_float2( nx.x * ntiles.x, nx.y * ntiles.y );
 
     // Set cell size
@@ -1746,6 +1743,12 @@ void Species::initialize( float2 const box_, uint2 const ntiles, uint2 const nx,
 
     // Inject the particles
     inject( particles -> g_range() );
+    std::printf( "[%s] injected np_total=%lu particles\n", name.c_str(), particles->np_total() );
+
+    // Set charge normalization factor
+    // Computed after injection so count-based profiles (e.g. Sparse) can use the
+    // number of macroparticles actually placed.
+    q = copysign( density->norm_charge( ppc ), m_q );
 
     // Set inital velocity distribution
     udist -> set( *particles, id );

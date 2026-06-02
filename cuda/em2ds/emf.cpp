@@ -261,7 +261,7 @@ void update_fE( fft::complex64 * const __restrict__ d_fE,
         const float kx = ix * dk.x;
         const float k2 = kx*kx + ky*ky;
         const float β = ( k2 > 0 ) ? 1.f / k2 : 0;
-        
+
         fEx[idx] = -fft::I * kx * frho[idx] * β + fEtx[idx];
 		fEy[idx] = -fft::I * ky * frho[idx] * β + fEty[idx];
 		fEz[idx] =                                fEtz[idx] ;
@@ -331,8 +331,45 @@ void EMF::advance( Current & current, Charge & charge ) {
 }
 
 /**
+ * @brief Set EM fields at t=0
+ *
+ * @param type      Initialization type
+ * @param charge    Charge object with frho already populated
+ */
+void EMF::set_init_fields( emf::init_type::type type, Charge & charge ) {
+
+    if ( iter != 0 ) {
+        ABORT( "EMF::set_init_fields() may only be called at iter = 0" );
+    }
+
+    switch ( type ) {
+        case emf::init_type::poisson:
+
+            // Compute fE from frho (fEt = 0 at init, so this is pure Poisson)
+            kernel::update_fE <<< fE -> dims.y, 256 >>> (
+                reinterpret_cast<fft::complex64 *>( fE  -> d_buffer ),
+                reinterpret_cast<fft::complex64 *>( fEt -> d_buffer ),
+                reinterpret_cast<fft::complex64 *>( charge.frho -> d_buffer ),
+                fE -> dims, fft::dk( box )
+            );
+
+            // Transform to real-space E
+            fft_backward -> transform( *fE, *E );
+
+            // Update guard cell values
+            E -> copy_to_gc();
+
+            break;
+
+        case emf::init_type::none:
+        default:
+            break;
+    }
+}
+
+/**
  * @brief Save EMF data to diagnostic file
- * 
+ *
  * @param field     Field to save (0:E, 1:B)
  * @param fc        Field component to save (0, 1 or 2)
  */

@@ -76,8 +76,54 @@ class Simulation {
     }
 
     /**
+     * @brief Initialize EM fields at t=0
+     *
+     * @param type      Initialization type
+     */
+    void init_fields( emf::init_type::type type ) {
+
+        if ( iter != 0 ) {
+            ABORT( "Simulation::init_fields() may only be called at iter = 0" );
+        }
+
+        // Zero global current and charge
+        current.zero( );
+        charge.zero( );
+
+        switch ( type ) {
+            case emf::init_type::poisson:
+
+                // Deposit initial charge density from all species
+                for ( auto & sp : species ) sp -> deposit_charge( *charge.rho );
+
+                // Sum partial deposits across tile boundaries
+                charge.rho -> add_from_gc();
+
+                // FFT to k-space (no neutral background, Poisson kernel zeros k=0 mode)
+                charge.fft_forward -> transform( *charge.rho, *charge.frho );
+
+                // For now no filtering applied  
+                // charge.filter -> apply( *frho );
+
+                // Solve Poisson for longitudinal E-field
+                emf.set_init_fields( type, charge );
+
+                break;
+
+            case emf::init_type::none:
+            default:
+                break;
+        }
+
+        // Reset all iteration counters to 0
+        charge.reset_iter();
+        emf.reset_iter();
+                
+    }
+
+    /**
      * @brief Advance simulation 1 iteration
-     * 
+     *
      */
     void advance( ) {
 
