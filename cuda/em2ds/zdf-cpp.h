@@ -134,6 +134,11 @@ int add_quant_part_file( t_zdf_file &file, std::string name, float * const data,
 }
 
 static inline
+int add_quant_part_file( t_zdf_file &file, std::string name, uint64_t * const data, const uint64_t np ) {
+    return zdf_add_quant_part_file_uint64( &file, name.c_str(), data, np );
+}
+
+static inline
 int close_file( t_zdf_file &file ) { return zdf_close_file(&file);};
 
 

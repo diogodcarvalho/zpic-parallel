@@ -34,8 +34,9 @@ int constexpr opt_min_blocks = 2048;
  * @param m_q   Mass over charge ratio
  * @param ppc   Number of particles per cell
  */
-Species::Species( std::string const name, float const m_q, uint2 const ppc ):
-    ppc(ppc), name(name), m_q(m_q)
+Species::Species( std::string const name, float const m_q, uint2 const ppc,
+    bool const add_tag ):
+    ppc(ppc), add_tag(add_tag), name(name), m_q(m_q)
 {
 
     // Validate parameters
@@ -1095,17 +1096,20 @@ void Species::save() const {
 
     const char * quants[] = {
         "x","y",
-        "ux","uy","uz"
+        "ux","uy","uz",
+        "tag",
     };
 
     const char * qlabels[] = {
         "x","y",
-        "u_x","u_y","u_z"
+        "u_x","u_y","u_z",
+        "tag"
     };
 
     const char * qunits[] = {
         "c/\\omega_n", "c/\\omega_n",
-        "c","c","c"
+        "c","c","c",
+        ""
     };
 
     zdf::iteration iter_info = {
@@ -1118,7 +1122,7 @@ void Species::save() const {
     zdf::part_info info = {
         .name = (char *) name.c_str(),
         .label = (char *) name.c_str(),
-        .nquants = 5,
+        .nquants = add_tag ? 6u : 5u,
         .quants = (char **) quants,
         .qlabels = (char **) qlabels,
         .qunits = (char **) qunits,
@@ -1174,6 +1178,19 @@ void Species::save() const {
     }
     zdf::add_quant_part_file( part_file, "uz", h_data, np );
 
+    // Particle tags (integer quantity)
+    uint64_t *d_tag = nullptr;
+    uint64_t *h_tag = nullptr;
+    if ( add_tag ) {
+        if ( np > 0 ) {
+            d_tag = device::malloc<uint64_t>( np );
+            h_tag = host::malloc<uint64_t>( np );
+            particles -> gather( part::quant::tag, d_tag );
+            device::memcpy_tohost( h_tag, d_tag, np );
+        }
+        zdf::add_quant_part_file( part_file, "tag", h_tag, np );
+    }
+
     // Close the file
     zdf::close_file( part_file );
 
@@ -1181,7 +1198,12 @@ void Species::save() const {
     if ( np > 0 ) {
         device::free( d_data );
         host::free( h_data );
+        if ( add_tag ) {
+            device::free( d_tag );
+            host::free( h_tag );
+        }
     }
+
 }
 
 /**
@@ -1715,11 +1737,11 @@ void Species::initialize( float2 const box_, uint2 const ntiles, uint2 const nx,
     // Reference number maximum number of particles
     unsigned int max_part = 1.2 * gnx.x * gnx.y * ppc.x * ppc.y;
 
-    particles = new Particles( ntiles, nx, max_part );
+    particles = new Particles( ntiles, nx, max_part, add_tag );
     particles->periodic.x = ( bc.x.lower == species::bc::periodic );
     particles->periodic.y = ( bc.y.lower == species::bc::periodic );
 
-    tmp = new Particles( ntiles, nx, max_part );
+    tmp = new Particles( ntiles, nx, max_part, add_tag );
     sort = new ParticleSort( ntiles, max_part );
     np_inj = device::malloc<int>( ntiles.x * ntiles.y );
 
@@ -1744,6 +1766,10 @@ void Species::initialize( float2 const box_, uint2 const ntiles, uint2 const nx,
     // Inject the particles
     inject( particles -> g_range() );
     std::printf( "[%s] injected np_total=%lu particles\n", name.c_str(), particles->np_total() );
+
+    // Assign a unique tag to every injected particle (buffer is still compact)
+    if ( add_tag )
+        particles -> set_tags();
 
     // Set charge normalization factor
     // Computed after injection so count-based profiles (e.g. Sparse) can use the

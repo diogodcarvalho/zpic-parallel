@@ -353,11 +353,12 @@ void test_sparse( std::string param ) {
     float  dx      = 0.001f;             // cell size (same in x and y)
     float  dx_part = 0.032f;             // sparse density spacing (same in x and y)
     uint2  spacing{ 0, 0 };              // lattice spacing in cells (overrides dx_part if set)
+    uint2  ppc    { 0, 0 };              // if set, use uniform density with this ppc instead of sparse
     float  dt      = 0.000692965f;       // time step
     uint  n_dump  = 100;                // diagnostic output interval (in number of timesteps)
     float  tmax    = 0.002f;             // total simulation time
     float3 uth    { 0.0f, 0.0f, 0.0f };  // thermal velocity
-    float3 ufl    { 0.1f, 0.0f, 0.0f };  // fluid velocity
+    float3 ufl    { 0.0f, 0.0f, 0.0f };  // fluid velocity
     
     // Parse whitespace-separated "key=value" pairs. 
     // Vector values are comma-separated, e.g. "ntiles=4,4" or "uth=0.1,0,0".
@@ -383,6 +384,8 @@ void test_sparse( std::string param ) {
         else if ( key == "tmax"    ) { got = std::sscanf( val.c_str(), "%f",       &tmax );                  want = 1; }
         else if ( key == "dx_part" ) { got = std::sscanf( val.c_str(), "%f",       &dx_part );               want = 1; }
         else if ( key == "spacing" ) { got = std::sscanf( val.c_str(), "%u,%u",    &spacing.x, &spacing.y ); want = 2; }
+        else if ( key == "ppc"     ) { got = std::sscanf( val.c_str(), "%u,%u",    &ppc.x, &ppc.y );
+                                       if ( got == 1 ) { ppc.y = ppc.x; got = 2; }                          want = 2; }
         else {
             std::cerr << "Unknown parameter key: '" << key << "'\n";
             std::exit(1);
@@ -399,7 +402,9 @@ void test_sparse( std::string param ) {
     std::cout << "nx (tile) : " << nx      << '\n';
     std::cout << "dx        : " << dx      << '\n';
     std::cout << "box       : " << box     << '\n';
-    if ( spacing.x > 0 && spacing.y > 0 )
+    if ( ppc.x > 0 && ppc.y > 0 )
+        std::cout << "ppc       : " << ppc     << " (uniform density)\n";
+    else if ( spacing.x > 0 && spacing.y > 0 )
         std::cout << "spacing   : " << spacing << '\n';
     else
         std::cout << "dx_part   : " << dx_part << '\n';
@@ -411,10 +416,17 @@ void test_sparse( std::string param ) {
     
     Simulation sim( ntiles, nx, box, dt );
 
-    uint2 ppc{ 1, 1 };
+    // When a ppc is given, fall back to uniform density; otherwise the
+    // sparse/lattice profiles place one particle per density site (ppc 1,1).
+    bool uniform = ( ppc.x > 0 && ppc.y > 0 );
+    if ( ! uniform ) ppc = uint2{ 1, 1 };
 
-    Species electrons("electrons", -1.0f, ppc);
-    if ( spacing.x > 0 && spacing.y > 0 )
+    Species electrons("electrons", -1.0f, ppc, true);
+    if ( uniform )
+        electrons.set_density(
+            Density::Uniform(1.0)
+        );
+    else if ( spacing.x > 0 && spacing.y > 0 )
         electrons.set_density(
             Density::Lattice(1.0, spacing)
         );
@@ -458,6 +470,10 @@ void test_sparse( std::string param ) {
 
     while ( sim.get_t() <= tmax ) {
         sim.advance();
+        if ( sim.get_iter() % 100 == 0 ) {
+            std::cout << "iter = " << sim.get_iter()
+                      << ", t = " << sim.get_t() << '\n';
+        }
         if ( sim.get_iter() % n_dump == 0 ) {
             diag();
         }
@@ -515,6 +531,11 @@ void cli_help( char * argv0 ) {
 }
 
 int main( int argc, char *argv[] ) {
+
+    // Line-buffer stdout so progress prints appear immediately when output is
+    // redirected to a file (e.g. under srun), instead of being block-buffered.
+    std::setvbuf( stdout, nullptr, _IOLBF, 0 );
+    std::cout.setf( std::ios::unitbuf );
 
     // Initialize the gpu device
     gpu_init();

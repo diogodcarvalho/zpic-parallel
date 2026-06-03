@@ -301,9 +301,111 @@ void Particles::gather( part::quant quant, float * const __restrict__ d_data, co
     }
 }
 
+namespace kernel {
+
+/**
+ * @brief Assign a unique tag to every particle
+ *
+ * @details Each particle is labelled with its (1-based) global buffer index.
+ *          The buffer is assumed to be compact, so the labels are unique.
+ *
+ * @param part      Particle data
+ */
+__global__
+void set_tags( ParticleData part )
+{
+    const uint2 tile_idx = { blockIdx.x, blockIdx.y };
+    const int   tile_id  = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const auto  tile_off = part.offset[ tile_id ];
+    const auto  tile_np  = part.np[ tile_id ];
+
+    uint64_t * const __restrict__ tag = & part.tag[ tile_off ];
+
+    for( int idx = block_thread_rank(); idx < tile_np; idx += block_num_threads() ) {
+        tag[ idx ] = tile_off + idx + 1;
+    }
+}
+
+}
+
+/**
+ * @brief Assigns a unique tag to every particle
+ *
+ * @details Each particle is labelled with its (1-based) position in the global
+ *          particle buffer. Meant to be called once, right after the initial
+ *          injection, while the buffer is still compact.
+ */
+void Particles::set_tags()
+{
+    dim3 grid( ntiles.x, ntiles.y );
+    dim3 block( 1024 );
+
+    kernel::set_tags <<< grid, block >>> ( *this );
+}
+
+namespace kernel {
+
+/**
+ * @brief Gather integer particle data
+ *
+ * @tparam quant    Quantity to gather
+ * @param part      Particle data
+ * @param d_data    Output data
+ */
+template < part::quant quant >
+__global__
+void gather(
+    ParticleData part,
+    uint64_t * const __restrict__ d_data
+) {
+    const uint2 tile_idx = { blockIdx.x, blockIdx.y };
+    const int   tile_id  = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const auto  tile_off = part.offset[ tile_id ];
+    const auto  tile_np  = part.np[ tile_id ];
+
+    uint64_t const * __restrict__ const tag = & part.tag[ tile_off ];
+
+    for( int idx = block_thread_rank(); idx < tile_np; idx += block_num_threads() ) {
+        uint64_t val;
+        if constexpr ( quant == part::tag ) val = tag[idx];
+        d_data[ tile_off + idx ] = val;
+    }
+}
+
+}
+
+/**
+ * @brief Gather data from a specific integer particle quantity in a device buffer
+ *
+ * @note Currently only defined for part::tag
+ *
+ * @warning The output will use the same offset as the data buffer, so the
+ *          particle buffer must be compact
+ *
+ * @param quant         Quantity to gather
+ * @param d_data        Output data buffer (assumed to have sufficient size)
+ */
+void Particles::gather( part::quant quant, uint64_t * const __restrict__ d_data )
+{
+    dim3 grid( ntiles.x, ntiles.y );
+    dim3 block( 1024 );
+
+    // Gather data on device
+    switch (quant) {
+    case part::tag:
+        kernel::gather<part::tag> <<<grid,block>>>( *this, d_data );
+        break;
+    default:
+        std::cerr << "(*error*) Particles::gather(int): quantity not supported\n";
+        break;
+    }
+}
+
 /**
  * @brief Save particle data to disk
- * 
+ *
  * @param metadata  Particle metadata (name, labels, units, etc.). Information is used to
  *                  set file name
  * @param iter      Iteration metadata
@@ -686,6 +788,10 @@ void __launch_bounds__(opt_copy_out_block) copy_out(
     float2 * __restrict__ x   = &part.x[ old_offset ];
     float3 * __restrict__ u   = &part.u[ old_offset ];
 
+    // Tags are optional; only carried when the buffer has a tag array
+    const bool has_tag = ( part.tag != nullptr );
+    uint64_t * __restrict__ tag = has_tag ? &part.tag[ old_offset ] : nullptr;
+
     int * __restrict__ idx    = &sort.idx[ old_offset ];
     uint32_t const nidx       = sort.nidx[ tile_id ];
 
@@ -697,6 +803,7 @@ void __launch_bounds__(opt_copy_out_block) copy_out(
     int2* __restrict__  tmp_ix  = tmp.ix;
     float2* __restrict__ tmp_x  = tmp.x;
     float3* __restrict__ tmp_u  = tmp.u;
+    uint64_t* __restrict__ tmp_tag = tmp.tag;
 
     // Number of particles staying in tile
     const int n0 = npt[4];
@@ -775,14 +882,14 @@ void __launch_bounds__(opt_copy_out_block) copy_out(
         int2 nix  = ix[k];
         float2 nx = x[k];
         float3 nu = u[k];
-        
+
         int xcross = ( nix.x >= lim.x ) - ( nix.x < 0 );
         int ycross = ( nix.y >= lim.y ) - ( nix.y < 0 );
 
         const int dir = (ycross+1) * 3 + (xcross+1);
 
         // Check if particle crossed into a valid neighbor
-        if ( _dir_offset[dir] >= 0 ) {        
+        if ( _dir_offset[dir] >= 0 ) {
 
             // _dir_offset[] includes the offset in the global tmp particle buffer
             int l = block::atomic_fetch_add( & _dir_offset[dir], 1 );
@@ -793,6 +900,7 @@ void __launch_bounds__(opt_copy_out_block) copy_out(
             tmp_ix[ l ] = nix;
             tmp_x[ l ] = nx;
             tmp_u[ l ] = nu;
+            if ( has_tag ) tmp_tag[ l ] = tag[ k ];
         }
 
         // Fill hole if needed
@@ -801,13 +909,14 @@ void __launch_bounds__(opt_copy_out_block) copy_out(
 
             do {
                 c = block::atomic_fetch_add( &_c, 1 );
-                invalid = ( ix[c].x < 0 ) || ( ix[c].x >= lim.x ) || 
+                invalid = ( ix[c].x < 0 ) || ( ix[c].x >= lim.x ) ||
                           ( ix[c].y < 0 ) || ( ix[c].y >= lim.y );
             } while (invalid);
 
             ix[ k ] = ix[ c ];
             x [ k ] = x [ c ];
             u [ k ] = u [ c ];
+            if ( has_tag ) tag[ k ] = tag[ c ];
         }
     }
 
@@ -825,6 +934,7 @@ void __launch_bounds__(opt_copy_out_block) copy_out(
             tmp_ix[ new_idx + i ] = ix[ i ];
             tmp_x[ new_idx + i ]  = x [ i ];
             tmp_u[ new_idx + i ]  = u [ i ];
+            if ( has_tag ) tmp_tag[ new_idx + i ] = tag[ i ];
         }
 
     } else {
@@ -835,6 +945,7 @@ void __launch_bounds__(opt_copy_out_block) copy_out(
             tmp_ix[ new_idx + i ] = ix[ old_idx + i ];
             tmp_x[ new_idx + i ]  = x [ old_idx + i ];
             tmp_u[ new_idx + i ]  = u [ old_idx + i ];
+            if ( has_tag ) tmp_tag[ new_idx + i ] = tag[ old_idx + i ];
         }
     }
 
@@ -897,6 +1008,11 @@ void __launch_bounds__(opt_copy_in_block) copy_in(
     float2 * __restrict__ tmp_x  = &tmp.x [ new_offset ];
     float3 * __restrict__ tmp_u  = &tmp.u [ new_offset ];
 
+    // Tags are optional; only carried when the buffer has a tag array
+    const bool has_tag = ( part.tag != nullptr );
+    uint64_t * __restrict__ tag     = has_tag ? &part.tag[ new_offset ] : nullptr;
+    uint64_t * __restrict__ tmp_tag = has_tag ? &tmp.tag[ new_offset ]  : nullptr;
+
     if ( new_offset >= old_offset ) {
 
         // Add particles to the end of the buffer
@@ -904,6 +1020,7 @@ void __launch_bounds__(opt_copy_in_block) copy_in(
             ix[ old_np + i ] = tmp_ix[ i ];
             x[ old_np + i ]  = tmp_x[ i ];
             u[ old_np + i ]  = tmp_u[ i ];
+            if ( has_tag ) tag[ old_np + i ] = tmp_tag[ i ];
         }
 
     } else {
@@ -911,11 +1028,12 @@ void __launch_bounds__(opt_copy_in_block) copy_in(
         // Add particles to the beggining of buffer
         int np0 = old_offset - new_offset;
         if ( np0 > tmp_np ) np0 = tmp_np;
-        
+
         for( int i = block_thread_rank(); i < np0; i += block_num_threads() ) {
             ix[ i ] = tmp_ix[ i ];
             x[ i ]  = tmp_x[ i ];
             u[ i ]  = tmp_u[ i ];
+            if ( has_tag ) tag[ i ] = tmp_tag[ i ];
         }
 
         // If any particles left, add particles to the end of the buffer
@@ -923,6 +1041,7 @@ void __launch_bounds__(opt_copy_in_block) copy_in(
             ix[ old_np + i ] = tmp_ix[ i ];
             x[ old_np + i ]  = tmp_x[ i ];
             u[ old_np + i ]  = tmp_u[ i ];
+            if ( has_tag ) tag[ old_np + i ] = tmp_tag[ i ];
         }
 
     }
@@ -990,6 +1109,10 @@ void copy_sorted(
     float2 * __restrict__ x   = &part.x[ old_offset ];
     float3 * __restrict__ u   = &part.u[ old_offset ];
 
+    // Tags are optional; only carried when the buffer has a tag array
+    const bool has_tag = ( part.tag != nullptr );
+    uint64_t * __restrict__ tag = has_tag ? &part.tag[ old_offset ] : nullptr;
+
     int * __restrict__ idx    = &sort.idx[ old_offset ];
     uint32_t const nidx       = sort.nidx[ tile_id ];
 
@@ -998,6 +1121,7 @@ void copy_sorted(
     int2* __restrict__  tmp_ix  = tmp.ix;
     float2* __restrict__ tmp_x  = tmp.x;
     float3* __restrict__ tmp_u  = tmp.u;
+    uint64_t* __restrict__ tmp_tag = tmp.tag;
 
     // Find offsets on new buffer
     for( int i = block_thread_rank(); i < 9; i += block_num_threads() ) {
@@ -1052,14 +1176,14 @@ void copy_sorted(
         int2 nix  = ix[k];
         float2 nx = x[k];
         float3 nu = u[k];
-        
+
         int xcross = ( nix.x >= lim.x ) - ( nix.x < 0 );
         int ycross = ( nix.y >= lim.y ) - ( nix.y < 0 );
 
         const int dir = (ycross+1) * 3 + (xcross+1);
 
         // Check if particle crossed into a valid neighbor
-        if ( _dir_offset[dir] >= 0 ) {        
+        if ( _dir_offset[dir] >= 0 ) {
 
             // _dir_offset[] includes the offset in the global tmp particle buffer
             int l = block::atomic_fetch_add( & _dir_offset[dir], 1 );
@@ -1070,6 +1194,7 @@ void copy_sorted(
             tmp_ix[ l ] = nix;
             tmp_x[ l ] = nx;
             tmp_u[ l ] = nu;
+            if ( has_tag ) tmp_tag[ l ] = tag[ k ];
         }
 
         // Fill hole if needed
@@ -1078,13 +1203,14 @@ void copy_sorted(
 
             do {
                 c = block::atomic_fetch_add( &_c, 1 );
-                invalid = ( ix[c].x < 0 ) || ( ix[c].x >= lim.x ) || 
+                invalid = ( ix[c].x < 0 ) || ( ix[c].x >= lim.x ) ||
                           ( ix[c].y < 0 ) || ( ix[c].y >= lim.y );
             } while (invalid);
 
             ix[ k ] = ix[ c ];
             x [ k ] = x [ c ];
             u [ k ] = u [ c ];
+            if ( has_tag ) tag[ k ] = tag[ c ];
         }
     }
 
@@ -1097,6 +1223,7 @@ void copy_sorted(
         tmp_ix[ start + i ] = ix[i];
         tmp_x [ start + i ] = x[i];
         tmp_u [ start + i ] = u[i];
+        if ( has_tag ) tmp_tag [ start + i ] = tag[i];
     }
 }
 

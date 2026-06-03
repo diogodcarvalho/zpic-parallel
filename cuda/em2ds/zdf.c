@@ -1637,6 +1637,22 @@ int zdf_add_quant_part_file( t_zdf_file *zdf, const char *name, const float* dat
 
 }
 
+int zdf_add_quant_part_file_uint64( t_zdf_file *zdf, const char *name, const uint64_t* data,
+    const uint64_t np ) {
+
+    t_zdf_dataset dataset = {
+        .name = (char *) name,
+        .data_type = zdf_uint64,
+        .ndims = 1,
+        .data = (void *) data
+    };
+
+    dataset.count[0] = np;
+
+    return( zdf_add_dataset( zdf, &dataset ) );
+
+}
+
 #ifdef __TEST_ZDF__
 
 #include <math.h>

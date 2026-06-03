@@ -414,6 +414,17 @@ int zdf_open_part_file( t_zdf_file *file, t_zdf_part_info *info,
 int zdf_add_quant_part_file( t_zdf_file *zdf, const char *name, const float* data,
     const uint64_t np );
 
+/**
+ * Adds individual unsigned integer particle quantity to file
+ * @param  zdf  File handle
+ * @param  name Quantity name
+ * @param  data Quantity data (uint64)
+ * @param  np   Number of particles
+ * @return      Number of bytes written on success, 0 on error
+ */
+int zdf_add_quant_part_file_uint64( t_zdf_file *zdf, const char *name, const uint64_t* data,
+    const uint64_t np );
+
 
 #ifdef __cplusplus
 }

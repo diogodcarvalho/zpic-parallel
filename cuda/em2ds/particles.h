@@ -13,7 +13,7 @@
  * 
  */
 namespace part {
-    enum quant { x, y, ux, uy, uz };
+    enum quant { x, y, ux, uy, uz, tag };
 }
 
 struct ParticleSortData {
@@ -92,6 +92,8 @@ struct ParticleData {
     float2 *x;
     /// @brief Particle velocity
     float3 *u;
+    /// @brief Particle tag (unique label assigned at injection, for tracking purposes)
+    uint64_t *tag;
 
     /// @brief Maximum number of particles in the buffer
     uint32_t max_part;
@@ -130,13 +132,15 @@ class Particles : public ParticleData {
      * @param ntiles    Number of tiles
      * @param nx        Tile grid size
      * @param max_part  Maximum number of particles
+     * @param add_tag   If true, allocate a per-particle tag buffer
      */
-    Particles( const uint2 ntiles, const uint2 nx, const uint32_t max_part ) :
-        ParticleData( ntiles, nx, max_part ), dev_tmp_uint32(), 
+    Particles( const uint2 ntiles, const uint2 nx, const uint32_t max_part,
+        bool const add_tag = false ) :
+        ParticleData( ntiles, nx, max_part ), dev_tmp_uint32(),
         periodic( int2{1,1} ), gnx ( uint2{ntiles.x * nx.x, ntiles.y * nx.y} )
     {
         const size_t bsize = ntiles.x * ntiles.y;
-        
+
         // Tile information
         np     = device::malloc<int>( bsize );
         offset = device::malloc<int>( bsize );
@@ -149,12 +153,15 @@ class Particles : public ParticleData {
         ix = device::malloc<int2>  ( max_part );
         x  = device::malloc<float2>( max_part );
         u  = device::malloc<float3>( max_part );
+        // Tags are optional; only allocate the buffer when requested
+        tag = add_tag ? device::malloc<uint64_t>( max_part ) : nullptr;
     }
 
     ~Particles() {
         device::free( u );
         device::free( x );
         device::free( ix );
+        device::free( tag );
 
         device::free( offset );
         device::free( np );
@@ -179,16 +186,21 @@ class Particles : public ParticleData {
      */
     void grow_buffer( uint32_t new_max ) {
         if ( new_max > max_part ) {
+            const bool has_tag = ( tag != nullptr );
+
             device::free( u );
             device::free( x );
             device::free( ix );
+            device::free( tag );
 
             // Grow in multiples 64k blocks
             max_part = roundup<65536>(new_max);
 
-            ix = device::malloc<int2>( max_part );
-            x  = device::malloc<float2>( max_part );
-            u  = device::malloc<float3>( max_part );
+            ix  = device::malloc<int2>( max_part );
+            x   = device::malloc<float2>( max_part );
+            u   = device::malloc<float3>( max_part );
+            // Only re-allocate the tag buffer if it was in use
+            tag = has_tag ? device::malloc<uint64_t>( max_part ) : nullptr;
         }
     }
 
@@ -199,9 +211,10 @@ class Particles : public ParticleData {
      * @param b     Object b
      */
     friend void swap_buffers( Particles & a, Particles & b ) {
-        swap( a.ix, b.ix );
-        swap( a.x,  b.x );
-        swap( a.u,  b.u );
+        swap( a.ix,  b.ix );
+        swap( a.x,   b.x );
+        swap( a.u,   b.u );
+        swap( a.tag, b.tag );
 
         auto tmp_max_part = b.max_part;
         b.max_part = a.max_part;
@@ -257,7 +270,7 @@ class Particles : public ParticleData {
     uint32_t const np );
 
     /**
-     * @brief Gather data from a specific particle quantity, scaling values
+     * @brief Gather data from a specific float particle quantity, scaling values
      * 
      * @note Data (val) will be returned as `scale.x * val + scale.y`
      * 
@@ -266,6 +279,24 @@ class Particles : public ParticleData {
      * @param scale     Scale factor for data
      */
     void gather( part::quant quant, float * const __restrict__ d_data, const float2 scale );
+
+    /**
+     * @brief Gather data from a specific integer particle quantity
+     *
+     * @param quant     Quantity to gather
+     * @param d_data    Output data buffer, assumed to have size >= np
+     */
+    void gather( part::quant quant, uint64_t * const __restrict__ d_data );
+
+    /**
+     * @brief Assigns a unique tag to every particle
+     *
+     * @details Each particle is labelled with its (1-based) position in the
+     *          global particle buffer. Meant to be called once, right after
+     *          the initial injection, while the buffer is still compact. The
+     *          tag travels with the particle through subsequent tile sorts.
+     */
+    void set_tags();
 
     /**
      * @brief Validates particle data
@@ -303,8 +334,8 @@ class Particles : public ParticleData {
      *                  room for particles to be injected later.
      */
     void tile_sort( const int * __restrict__ extra = nullptr ){
-        // Create temporary buffers
-        Particles tmp( ntiles, nx, max_part );
+        // Create temporary buffers (matching tag allocation)
+        Particles tmp( ntiles, nx, max_part, tag != nullptr );
         ParticleSort sort( ntiles, max_part );
         
         // Call sort routine

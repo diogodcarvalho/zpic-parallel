@@ -101,6 +101,9 @@ protected:
     /// @brief Number of particles being injected
     int * np_inj;
 
+    /// @brief Whether to assign and save per-particle tags
+    bool add_tag;
+
     /**
      * @brief Process (physical) boundary conditions
      * 
@@ -161,11 +164,13 @@ public:
     /**
      * @brief Construct a new Species object
      * 
-     * @param name  Name for the species object (used for diagnostics)
-     * @param m_q   Mass over charge ratio
-     * @param ppc   Number of particles per cell
+     * @param name     Name for the species object (used for diagnostics)
+     * @param m_q       Mass over charge ratio
+     * @param ppc       Number of particles per cell
+     * @param add_tag   If true, assign and save a unique tag per particle
      */
-    Species( std::string const name, float const m_q, uint2 const ppc );
+    Species( std::string const name, float const m_q, uint2 const ppc,
+        bool const add_tag = false );
 
     /**
      * @brief Initialize data structures
