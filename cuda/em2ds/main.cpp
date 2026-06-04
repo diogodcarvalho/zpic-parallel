@@ -356,10 +356,13 @@ void test_sparse( std::string param ) {
     uint2  ppc    { 0, 0 };              // if set, use uniform density with this ppc instead of sparse
     float  dt      = 0.000692965f;       // time step
     uint  n_dump  = 100;                // diagnostic output interval (in number of timesteps)
+    uint  n_skip  = 0;                  // warm-up steps to run before the first dump (first dump at step n_skip)
     float  tmax    = 0.002f;             // total simulation time
     float3 uth    { 0.0f, 0.0f, 0.0f };  // thermal velocity
     float3 ufl    { 0.0f, 0.0f, 0.0f };  // fluid velocity
     bool   filter  = true;               // apply digital filtering to current/charge
+    unsigned seed  = 0;                  // RNG seed offset (vary for independent replicas)
+    uint  save_part = 1;                 // dump particle phase space at each diag (0 = energy only, e.g. warm-up probe)
 
     // Parse whitespace-separated "key=value" pairs. 
     // Vector values are comma-separated, e.g. "ntiles=4,4" or "uth=0.1,0,0".
@@ -382,12 +385,15 @@ void test_sparse( std::string param ) {
         else if ( key == "uth"     ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &uth.x, &uth.y, &uth.z ); want = 3; }
         else if ( key == "ufl"     ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &ufl.x, &ufl.y, &ufl.z ); want = 3; }
         else if ( key == "n_dump"  ) { got = std::sscanf( val.c_str(), "%u",       &n_dump );                want = 1; }
+        else if ( key == "n_skip"  ) { got = std::sscanf( val.c_str(), "%u",       &n_skip );                want = 1; }
         else if ( key == "tmax"    ) { got = std::sscanf( val.c_str(), "%f",       &tmax );                  want = 1; }
         else if ( key == "dx_part" ) { got = std::sscanf( val.c_str(), "%f",       &dx_part );               want = 1; }
         else if ( key == "spacing" ) { got = std::sscanf( val.c_str(), "%u,%u",    &spacing.x, &spacing.y ); want = 2; }
         else if ( key == "ppc"     ) { got = std::sscanf( val.c_str(), "%u,%u",    &ppc.x, &ppc.y );
                                        if ( got == 1 ) { ppc.y = ppc.x; got = 2; }                          want = 2; }
         else if ( key == "filter"  ) { int b; got = std::sscanf( val.c_str(), "%d", &b ); filter = ( b != 0 ); want = 1; }
+        else if ( key == "seed"    ) { got = std::sscanf( val.c_str(), "%u",       &seed );                  want = 1; }
+        else if ( key == "save_part") { got = std::sscanf( val.c_str(), "%u",       &save_part );             want = 1; }
         else {
             std::cerr << "Unknown parameter key: '" << key << "'\n";
             std::exit(1);
@@ -412,10 +418,13 @@ void test_sparse( std::string param ) {
         std::cout << "dx_part   : " << dx_part << '\n';
     std::cout << "dt        : " << dt      << '\n';
     std::cout << "n_dump    : " << n_dump  << '\n';
+    std::cout << "n_skip    : " << n_skip  << " (first dump at t = " << n_skip * dt << ")\n";
     std::cout << "tmax      : " << tmax    << '\n';
     std::cout << "uth       : " << uth     << '\n';
     std::cout << "ufl       : " << ufl     << '\n';
     std::cout << "filter    : " << ( filter ? "on" : "off" ) << '\n';
+    std::cout << "seed      : " << seed    << '\n';
+    std::cout << "save_part : " << save_part << '\n';
 
     Simulation sim( ntiles, nx, box, dt );
 
@@ -448,6 +457,7 @@ void test_sparse( std::string param ) {
     electrons.set_udist(
         UDistribution::ThermalCorr( uth, ufl )
     );
+    electrons.seed = seed;
 
     sim.add_species( electrons );
 
@@ -471,13 +481,19 @@ void test_sparse( std::string param ) {
         // sim.charge.save();
         // electrons.save_charge();
 
-        electrons.save();
+        if ( save_part )
+            electrons.save();
         sim.energy_info();
     };
 
     Timer timer; timer.start();
 
-    diag();
+    // Optional warm-up: run the first n_skip steps without dumping (e.g. to let
+    // initial plasma oscillations settle). The first dump then lands exactly at
+    // step n_skip (t = n_skip*dt), and every n_dump steps thereafter. With
+    // n_skip = 0 this reduces to the usual dump at t = 0.
+    if ( n_skip == 0 )
+        diag();
 
     while ( sim.get_t() <= tmax ) {
         sim.advance();
@@ -485,7 +501,8 @@ void test_sparse( std::string param ) {
             std::cout << "iter = " << sim.get_iter()
                       << ", t = " << sim.get_t() << '\n';
         }
-        if ( sim.get_iter() % n_dump == 0 ) {
+        unsigned const it = sim.get_iter();
+        if ( it >= n_skip && ( it - n_skip ) % n_dump == 0 ) {
             diag();
         }
     }

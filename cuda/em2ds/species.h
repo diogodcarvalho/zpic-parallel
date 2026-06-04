@@ -161,6 +161,9 @@ public:
     /// @brief Type of particle pusher to use
     species::pusher push_type;
 
+    /// @brief Base RNG seed for the initial velocity distribution
+    unsigned int seed = 0;
+
     /**
      * @brief Construct a new Species object
      * 

@@ -1776,8 +1776,10 @@ void Species::initialize( float2 const box_, uint2 const ntiles, uint2 const nx,
     // number of macroparticles actually placed.
     q = copysign( density->norm_charge( ppc ), m_q );
 
-    // Set inital velocity distribution
-    udist -> set( *particles, id );
+    // Set inital velocity distribution. The user-supplied `seed` offsets the
+    // per-species seed so independent replicas (same physics, different seed)
+    // draw distinct velocity realizations.
+    udist -> set( *particles, id + seed );
 
     // particles -> validate( "After initial injection");
 }
