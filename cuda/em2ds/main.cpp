@@ -359,7 +359,8 @@ void test_sparse( std::string param ) {
     float  tmax    = 0.002f;             // total simulation time
     float3 uth    { 0.0f, 0.0f, 0.0f };  // thermal velocity
     float3 ufl    { 0.0f, 0.0f, 0.0f };  // fluid velocity
-    
+    bool   filter  = true;               // apply digital filtering to current/charge
+
     // Parse whitespace-separated "key=value" pairs. 
     // Vector values are comma-separated, e.g. "ntiles=4,4" or "uth=0.1,0,0".
     std::istringstream tokens( param );
@@ -386,6 +387,7 @@ void test_sparse( std::string param ) {
         else if ( key == "spacing" ) { got = std::sscanf( val.c_str(), "%u,%u",    &spacing.x, &spacing.y ); want = 2; }
         else if ( key == "ppc"     ) { got = std::sscanf( val.c_str(), "%u,%u",    &ppc.x, &ppc.y );
                                        if ( got == 1 ) { ppc.y = ppc.x; got = 2; }                          want = 2; }
+        else if ( key == "filter"  ) { int b; got = std::sscanf( val.c_str(), "%d", &b ); filter = ( b != 0 ); want = 1; }
         else {
             std::cerr << "Unknown parameter key: '" << key << "'\n";
             std::exit(1);
@@ -413,8 +415,17 @@ void test_sparse( std::string param ) {
     std::cout << "tmax      : " << tmax    << '\n';
     std::cout << "uth       : " << uth     << '\n';
     std::cout << "ufl       : " << ufl     << '\n';
-    
+    std::cout << "filter    : " << ( filter ? "on" : "off" ) << '\n';
+
     Simulation sim( ntiles, nx, box, dt );
+
+    // Disable digital filtering of current/charge (e.g. to measure collisionality)
+    if ( ! filter ) {
+        delete sim.current.filter;
+        sim.current.filter = new Filter::None();
+        delete sim.charge.filter;
+        sim.charge.filter = new Filter::None();
+    }
 
     // When a ppc is given, fall back to uniform density; otherwise the
     // sparse/lattice profiles place one particle per density site (ppc 1,1).
