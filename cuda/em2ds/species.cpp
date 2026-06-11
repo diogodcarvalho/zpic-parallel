@@ -361,11 +361,24 @@ void Species::advance( EMF const &emf, Current &current, Charge & charge ) {
 /**
  * @brief Quartic (4th order) spline weights for an in-cell position
  *
- * @param dx    Particle position inside cell ( -0.5 <= dx < 0.5 )
- * @param s     [out] 5 weights, ordered from cell-2 to cell+2
+ * Even-order splines are centered on the nearest grid point (not the cell center)
+ * so the 5 point stencil must be shifted by the returned cell offset.
+ *
+ * @param x     Particle position inside cell ( -0.5 <= x < 0.5 )
+ * @param s     [out] 5 weights, ordered from point-2 to point+2 around the
+ *              nearest grid point
+ * @return     Cell offset of the nearest grid point (0 or 1)
  */
-__device__ inline void spline_s4( const float dx, float s[5] )
+__device__ inline int spline_s4( const float x, float s[5] )
 {
+    // offset to be returned:
+    // 0 (no shift), closest grid point is the current cell left-corner
+    // 1 (shift), closest grid point is the next cell left-corner
+    const int ix_offset = ( x >= 0.0f );
+
+    // position with respect to closest grid-point (not grid-cell center)
+    const float dx = x + 0.5f - ix_offset;
+
     const float t0 = 0.5f - dx;
     const float t1 = 0.5f + dx;
     const float t2 = t0 * t1;
@@ -375,6 +388,8 @@ __device__ inline void spline_s4( const float dx, float s[5] )
     s[2] = 0.45833334f + t2 * ( 0.5f + 0.25f * t2 );
     s[3] = ( 0.25f + t1 * ( 1.f + t1 * ( 1.5f + t2 ) ) ) / 6.f;
     s[4] = ( t1 * t1 ) * ( t1 * t1 ) / 24.f;
+
+    return ix_offset;
 }
 
 namespace kernel {
@@ -410,9 +425,8 @@ inline void dep_current( float3 * const __restrict__ J, const int ystride,
     const float jy = q * u.y * rg;
     const float jz = q * u.z * rg;
 
-    int idx = ix.y * ystride + ix.x;
-
     // Linear Shape
+    // int idx = ix.y * ystride + ix.x;
     // const float S0x = 0.5f - x.x;
     // const float S1x = 0.5f + x.x;
 
@@ -437,8 +451,12 @@ inline void dep_current( float3 * const __restrict__ J, const int ystride,
 
     // Quartic Shape
     float sx[5], sy[5];
-    spline_s4( x.x, sx );
-    spline_s4( x.y, sy );
+    // Extra offset needed for even-order shape function since they are centered
+    // with respect to nearest cell corner and not grid cell.
+    const int ix_offset = spline_s4( x.x, sx );
+    const int iy_offset = spline_s4( x.y, sy );
+
+    const int idx = ( ix.y + iy_offset ) * ystride + ( ix.x + ix_offset );
 
     for ( int jj = -2; jj < 3; jj++ ) {
         for ( int ii = -2; ii < 3; ii++ ) {
@@ -453,9 +471,8 @@ inline void dep_current( float3 * const __restrict__ J, const int ystride,
 __device__
 inline void dep_charge( float * const __restrict__ rho, const int ystride, int2 ix, float2 x, float q )
 {
-    int idx = ix.y * ystride + ix.x;
-
     // Linear Shape
+    // int idx = ix.y * ystride + ix.x;
     // const float S0x = 0.5f - x.x;
     // const float S1x = 0.5f + x.x;
     // const float S0y = 0.5f - x.y;
@@ -468,8 +485,12 @@ inline void dep_charge( float * const __restrict__ rho, const int ystride, int2 
 
     // Quartic Shape
     float sx[5], sy[5];
-    spline_s4( x.x, sx );
-    spline_s4( x.y, sy );
+    // Extra offset needed for even-order shape function since they are centered
+    // with respect to nearest cell corner and not grid cell.
+    const int ix_offset = spline_s4( x.x, sx );
+    const int iy_offset = spline_s4( x.y, sy );
+
+    const int idx = ( ix.y + iy_offset ) * ystride + ( ix.x + ix_offset );
 
     for ( int jj = -2; jj < 3; jj++ ) {
         for ( int ii = -2; ii < 3; ii++ ) {
@@ -972,10 +993,12 @@ __device__ void interpolate_fld(
     const int2 ix, const float2 x, float3 & e, float3 & b)
 {
     float sx[5], sy[5];
-    spline_s4( x.x, sx );
-    spline_s4( x.y, sy );
+    // Extra offset needed for even-order shape function since they are centered
+    // with respect to nearest cell corner and not grid cell.
+    const int ix_offset = spline_s4( x.x, sx );
+    const int iy_offset = spline_s4( x.y, sy );
 
-    const int idx = ix.y * ystride + ix.x ;
+    const int idx = ( ix.y + iy_offset ) * ystride + ( ix.x + ix_offset );
 
     e = make_float3( 0.f, 0.f, 0.f );
     b = make_float3( 0.f, 0.f, 0.f );
@@ -1153,10 +1176,12 @@ void deposit_charge(
 
         // Quartic Shape
         float sx[5], sy[5];
-        spline_s4( x[i].x, sx );
-        spline_s4( x[i].y, sy );
+        // Extra offset needed for even-order shape function since they are centered
+        // with respect to nearest cell corner and not grid cell.
+        const int ix_offset = spline_s4( x[i].x, sx );
+        const int iy_offset = spline_s4( x[i].y, sy );
 
-        const int idx = ix[i].x + ix[i].y * ystride ;
+        const int idx = ( ix[i].x + iy_offset ) + ( ix[i].y + ix_offset ) * ystride;
 
         for ( int jj = -2; jj < 3; jj++ ) {
             for ( int ii = -2; ii < 3; ii++ ) {
@@ -1329,9 +1354,9 @@ void Species::save_charge() const {
     // gc.x = {0,1};
     // gc.y = {0,1};
 
-    // Quartic Shape (2 each side for the ±2 stencil)
-    gc.x = {2,2};
-    gc.y = {2,2};
+    // Quartic Shape (2 below, 3 above: ±2 stencil around the nearest grid point)
+    gc.x = {2,3};
+    gc.y = {2,3};
 
     // Deposit charge on device
     grid<float> charge( particles -> ntiles, particles -> nx, gc );

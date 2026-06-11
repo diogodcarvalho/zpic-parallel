@@ -72,9 +72,10 @@ class Current {
         // gc.x = {1,2};
         // gc.y = {1,2};
 
-        // Quartic Shape (3 each side: ±2 stencil + mid-step cell shift)
-        gc.x = {3,3};
-        gc.y = {3,3};
+        // Quartic Shape (3 below, 4 above: ±2 stencil around nearest grid
+        // point + mid-step cell shift)
+        gc.x = {3,4};
+        gc.y = {3,4};
 
         J = new vec3grid<float3> ( ntiles, nx, gc );
         J -> name = "Current";
