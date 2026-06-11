@@ -358,6 +358,25 @@ void Species::advance( EMF const &emf, Current &current, Charge & charge ) {
     iter++;
 }
 
+/**
+ * @brief Quartic (4th order) spline weights for an in-cell position
+ *
+ * @param dx    Particle position inside cell ( -0.5 <= dx < 0.5 )
+ * @param s     [out] 5 weights, ordered from cell-2 to cell+2
+ */
+__device__ inline void spline_s4( const float dx, float s[5] )
+{
+    const float t0 = 0.5f - dx;
+    const float t1 = 0.5f + dx;
+    const float t2 = t0 * t1;
+
+    s[0] = ( t0 * t0 ) * ( t0 * t0 ) / 24.f;
+    s[1] = ( 0.25f + t0 * ( 1.f + t0 * ( 1.5f + t2 ) ) ) / 6.f;
+    s[2] = 0.45833334f + t2 * ( 0.5f + 0.25f * t2 );
+    s[3] = ( 0.25f + t1 * ( 1.f + t1 * ( 1.5f + t2 ) ) ) / 6.f;
+    s[4] = ( t1 * t1 ) * ( t1 * t1 ) / 24.f;
+}
+
 namespace kernel {
 
 __device__
@@ -385,13 +404,7 @@ inline void dep_current( float3 * const __restrict__ J, const int ystride,
     );
 
     int2 ix  = make_int2( ix0.x + deltai.x, ix0.y + deltai.y );
-    float2 x = make_float2( x0.x - deltai.x, x0.y - deltai.y );
-
-    const float S0x = 0.5f - x.x;
-    const float S1x = 0.5f + x.x;
-
-    const float S0y = 0.5f - x.y;
-    const float S1y = 0.5f + x.y;
+    float2 x = make_float2( x1.x - deltai.x, x1.y - deltai.y );
 
     const float jx = q * u.x * rg;
     const float jy = q * u.y * rg;
@@ -399,39 +412,71 @@ inline void dep_current( float3 * const __restrict__ J, const int ystride,
 
     int idx = ix.y * ystride + ix.x;
 
-    block::atomic_fetch_add( & J[ idx               ].x, S0y * S0x * jx );
-    block::atomic_fetch_add( & J[ idx               ].y, S0y * S0x * jy );
-    block::atomic_fetch_add( & J[ idx               ].z, S0y * S0x * jz );
+    // Linear Shape
+    // const float S0x = 0.5f - x.x;
+    // const float S1x = 0.5f + x.x;
 
-    block::atomic_fetch_add( & J[ idx + 1           ].x, S0y * S1x * jx );
-    block::atomic_fetch_add( & J[ idx + 1           ].y, S0y * S1x * jy );
-    block::atomic_fetch_add( & J[ idx + 1           ].z, S0y * S1x * jz );
+    // const float S0y = 0.5f - x.y;
+    // const float S1y = 0.5f + x.y;
 
-    block::atomic_fetch_add( & J[ idx + ystride     ].x, S1y * S0x * jx );
-    block::atomic_fetch_add( & J[ idx + ystride     ].y, S1y * S0x * jy );
-    block::atomic_fetch_add( & J[ idx + ystride     ].z, S1y * S0x * jz );
+    // block::atomic_fetch_add( & J[ idx               ].x, S0y * S0x * jx );
+    // block::atomic_fetch_add( & J[ idx               ].y, S0y * S0x * jy );
+    // block::atomic_fetch_add( & J[ idx               ].z, S0y * S0x * jz );
 
-    block::atomic_fetch_add( & J[ idx + ystride + 1 ].x, S1y * S1x * jx );
-    block::atomic_fetch_add( & J[ idx + ystride + 1 ].y, S1y * S1x * jy );
-    block::atomic_fetch_add( & J[ idx + ystride + 1 ].z, S1y * S1x * jz );
+    // block::atomic_fetch_add( & J[ idx + 1           ].x, S0y * S1x * jx );
+    // block::atomic_fetch_add( & J[ idx + 1           ].y, S0y * S1x * jy );
+    // block::atomic_fetch_add( & J[ idx + 1           ].z, S0y * S1x * jz );
+
+    // block::atomic_fetch_add( & J[ idx + ystride     ].x, S1y * S0x * jx );
+    // block::atomic_fetch_add( & J[ idx + ystride     ].y, S1y * S0x * jy );
+    // block::atomic_fetch_add( & J[ idx + ystride     ].z, S1y * S0x * jz );
+
+    // block::atomic_fetch_add( & J[ idx + ystride + 1 ].x, S1y * S1x * jx );
+    // block::atomic_fetch_add( & J[ idx + ystride + 1 ].y, S1y * S1x * jy );
+    // block::atomic_fetch_add( & J[ idx + ystride + 1 ].z, S1y * S1x * jz );
+
+    // Quartic Shape
+    float sx[5], sy[5];
+    spline_s4( x.x, sx );
+    spline_s4( x.y, sy );
+
+    for ( int jj = -2; jj < 3; jj++ ) {
+        for ( int ii = -2; ii < 3; ii++ ) {
+            const float s = sx[ii + 2] * sy[jj + 2];
+            block::atomic_fetch_add( & J[ idx + ii + jj * ystride].x, s * jx );
+            block::atomic_fetch_add( & J[ idx + ii + jj * ystride].y, s * jy );
+            block::atomic_fetch_add( & J[ idx + ii + jj * ystride].z, s * jz );
+        }
+    }
 }
 
 __device__
 inline void dep_charge( float * const __restrict__ rho, const int ystride, int2 ix, float2 x, float q )
 {
-
-    const float S0x = 0.5f - x.x;
-    const float S1x = 0.5f + x.x;
-
-    const float S0y = 0.5f - x.y;
-    const float S1y = 0.5f + x.y;
-
     int idx = ix.y * ystride + ix.x;
 
-    block::atomic_fetch_add( & rho[ idx               ], S0y * S0x * q );
-    block::atomic_fetch_add( & rho[ idx + 1           ], S0y * S1x * q );
-    block::atomic_fetch_add( & rho[ idx + ystride     ], S1y * S0x * q );
-    block::atomic_fetch_add( & rho[ idx + ystride + 1 ], S1y * S1x * q );
+    // Linear Shape
+    // const float S0x = 0.5f - x.x;
+    // const float S1x = 0.5f + x.x;
+    // const float S0y = 0.5f - x.y;
+    // const float S1y = 0.5f + x.y;
+    
+    // block::atomic_fetch_add( & rho[ idx               ], S0y * S0x * q );
+    // block::atomic_fetch_add( & rho[ idx + 1           ], S0y * S1x * q );
+    // block::atomic_fetch_add( & rho[ idx + ystride     ], S1y * S0x * q );
+    // block::atomic_fetch_add( & rho[ idx + ystride + 1 ], S1y * S1x * q );
+
+    // Quartic Shape
+    float sx[5], sy[5];
+    spline_s4( x.x, sx );
+    spline_s4( x.y, sy );
+
+    for ( int jj = -2; jj < 3; jj++ ) {
+        for ( int ii = -2; ii < 3; ii++ ) {
+            const float s = sx[ii + 2] * sy[jj + 2];
+            block::atomic_fetch_add( & rho[ idx + ii + jj * ystride], s * q );
+        }
+    }
 }
 
 __global__
@@ -852,9 +897,62 @@ __device__ float3 dudt_boris_euler( const float alpha, float3 e, float3 b, float
 }
 
 
+// /**
+//  * @brief Interpolate EM field values at particle position using linear 
+//  * (1st order) interpolation.
+//  * 
+//  * The EM fields are assumed to be organized according to the Yee scheme with
+//  * the charge defined at lower left corner of the cell
+//  * 
+//  * @param E         Pointer to position (0,0) of E field grid
+//  * @param B         Pointer to position (0,0) of B field grid
+//  * @param ystride   E and B grids y stride (must be signed)
+//  * @param ix        Particle cell index
+//  * @param x         Particle postion inside cell
+//  * @param e[out]    E field at particle position
+//  * @param b[out]    B field at particleposition
+//  */
+// __device__ void interpolate_fld( 
+//     float3 const * const __restrict__ E, 
+//     float3 const * const __restrict__ B, 
+//     const int ystride,
+//     const int2 ix, const float2 x, float3 & e, float3 & b)
+// {
+//     const int i = ix.x;
+//     const int j = ix.y;
+
+//     const float s0x = 0.5f - x.x;
+//     const float s1x = 0.5f + x.x;
+
+//     const float s0y = 0.5f - x.y;
+//     const float s1y = 0.5f + x.y;
+
+//     // Interpolate E field
+
+//     e.x = ( E[i +    j *ystride].x * s0x + E[i+1 +    j *ystride].x * s1x ) * s0y +
+//           ( E[i + (j+1)*ystride].x * s0x + E[i+1 + (j+1)*ystride].x * s1x ) * s1y;
+
+//     e.y = ( E[i +    j *ystride].y * s0x + E[i+1 +    j *ystride].y * s1x ) * s0y +
+//           ( E[i + (j+1)*ystride].y * s0x + E[i+1 + (j+1)*ystride].y * s1x ) * s1y;
+
+//     e.z = ( E[i +    j *ystride].z * s0x + E[i+1 +    j *ystride].z * s1x ) * s0y +
+//           ( E[i + (j+1)*ystride].z * s0x + E[i+1 + (j+1)*ystride].z * s1x ) * s1y;
+
+//     // Interpolate B field
+//     b.x = ( B[i +    j *ystride].x * s0x + B[i+1 +    j *ystride].x * s1x ) * s0y +
+//           ( B[i + (j+1)*ystride].x * s0x + B[i+1 + (j+1)*ystride].x * s1x ) * s1y;
+
+//     b.y = ( B[i +    j *ystride].y * s0x + B[i+1 +    j *ystride].y * s1x ) * s0y +
+//           ( B[i + (j+1)*ystride].y * s0x + B[i+1 + (j+1)*ystride].y * s1x ) * s1y;
+
+//     b.z = ( B[i +    j *ystride].z * s0x + B[i+1 +    j *ystride].z * s1x ) * s0y +
+//           ( B[i + (j+1)*ystride].z * s0x + B[i+1 + (j+1)*ystride].z * s1x ) * s1y;
+// }
+
+
 /**
- * @brief Interpolate EM field values at particle position using linear 
- * (1st order) interpolation.
+ * @brief Interpolate EM field values at particle position using quartic
+ * (4th order) interpolation.
  * 
  * The EM fields are assumed to be organized according to the Yee scheme with
  * the charge defined at lower left corner of the cell
@@ -873,35 +971,31 @@ __device__ void interpolate_fld(
     const int ystride,
     const int2 ix, const float2 x, float3 & e, float3 & b)
 {
-    const int i = ix.x;
-    const int j = ix.y;
+    float sx[5], sy[5];
+    spline_s4( x.x, sx );
+    spline_s4( x.y, sy );
 
-    const float s0x = 0.5f - x.x;
-    const float s1x = 0.5f + x.x;
+    const int idx = ix.y * ystride + ix.x ;
 
-    const float s0y = 0.5f - x.y;
-    const float s1y = 0.5f + x.y;
+    e = make_float3( 0.f, 0.f, 0.f );
+    b = make_float3( 0.f, 0.f, 0.f );
 
-    // Interpolate E field
+    for ( int jj = -2; jj < 3; jj++ ) {
+        for ( int ii = -2; ii < 3; ii++ ) {
+            const float s = sx[ii + 2] * sy[jj + 2];
 
-    e.x = ( E[i +    j *ystride].x * s0x + E[i+1 +    j *ystride].x * s1x ) * s0y +
-          ( E[i + (j+1)*ystride].x * s0x + E[i+1 + (j+1)*ystride].x * s1x ) * s1y;
+            const float3 fe = E[ idx + ii + jj * ystride ];
+            const float3 fb = B[ idx + ii + jj * ystride ];
 
-    e.y = ( E[i +    j *ystride].y * s0x + E[i+1 +    j *ystride].y * s1x ) * s0y +
-          ( E[i + (j+1)*ystride].y * s0x + E[i+1 + (j+1)*ystride].y * s1x ) * s1y;
+            e.x += s * fe.x;
+            e.y += s * fe.y;
+            e.z += s * fe.z;
 
-    e.z = ( E[i +    j *ystride].z * s0x + E[i+1 +    j *ystride].z * s1x ) * s0y +
-          ( E[i + (j+1)*ystride].z * s0x + E[i+1 + (j+1)*ystride].z * s1x ) * s1y;
-
-    // Interpolate B field
-    b.x = ( B[i +    j *ystride].x * s0x + B[i+1 +    j *ystride].x * s1x ) * s0y +
-          ( B[i + (j+1)*ystride].x * s0x + B[i+1 + (j+1)*ystride].x * s1x ) * s1y;
-
-    b.y = ( B[i +    j *ystride].y * s0x + B[i+1 +    j *ystride].y * s1x ) * s0y +
-          ( B[i + (j+1)*ystride].y * s0x + B[i+1 + (j+1)*ystride].y * s1x ) * s1y;
-
-    b.z = ( B[i +    j *ystride].z * s0x + B[i+1 +    j *ystride].z * s1x ) * s0y +
-          ( B[i + (j+1)*ystride].z * s0x + B[i+1 + (j+1)*ystride].z * s1x ) * s1y;
+            b.x += s * fb.x;
+            b.y += s * fb.y;
+            b.z += s * fb.z;
+        }
+    }
 }
 
 
@@ -1045,16 +1139,31 @@ void deposit_charge(
     float2 const * __restrict__ const x  = &part.x[ offset ];
 
     for( int i = block_thread_rank(); i < np; i += block_num_threads() ) {
-        const int idx = ix[i].y * ystride + ix[i].x;
-        const float s0x = 0.5f - x[i].x;
-        const float s1x = 0.5f + x[i].x;
-        const float s0y = 0.5f - x[i].y;
-        const float s1y = 0.5f + x[i].y;
+        // Linear Shape
+        // const int idx = ix[i].y * ystride + ix[i].x;
+        // const float s0x = 0.5f - x[i].x;
+        // const float s1x = 0.5f + x[i].x;
+        // const float s0y = 0.5f - x[i].y;
+        // const float s1y = 0.5f + x[i].y;
 
-        block::atomic_fetch_add( & charge[ idx               ], s0y * s0x * q );
-        block::atomic_fetch_add( & charge[ idx + 1           ], s0y * s1x * q );
-        block::atomic_fetch_add( & charge[ idx     + ystride ], s1y * s0x * q );
-        block::atomic_fetch_add( & charge[ idx + 1 + ystride ], s1y * s1x * q );
+        // block::atomic_fetch_add( & charge[ idx               ], s0y * s0x * q );
+        // block::atomic_fetch_add( & charge[ idx + 1           ], s0y * s1x * q );
+        // block::atomic_fetch_add( & charge[ idx     + ystride ], s1y * s0x * q );
+        // block::atomic_fetch_add( & charge[ idx + 1 + ystride ], s1y * s1x * q );
+
+        // Quartic Shape
+        float sx[5], sy[5];
+        spline_s4( x[i].x, sx );
+        spline_s4( x[i].y, sy );
+
+        const int idx = ix[i].x + ix[i].y * ystride ;
+
+        for ( int jj = -2; jj < 3; jj++ ) {
+            for ( int ii = -2; ii < 3; ii++ ) {
+                const float s = sx[ii + 2] * sy[jj + 2];
+                block::atomic_fetch_add( & charge[ idx + ii + jj * ystride], s * q );
+            }
+        }
     }
 
     block_sync();
@@ -1214,10 +1323,15 @@ void Species::save() const {
  */
 void Species::save_charge() const {
 
-    // For linear interpolation we only require 1 guard cell at the upper boundary
     bnd<unsigned int> gc;
-    gc.x = {0,1};
-    gc.y = {0,1};
+
+    // Linear Shape (1 guard cell at the upper boundary)
+    // gc.x = {0,1};
+    // gc.y = {0,1};
+
+    // Quartic Shape (2 each side for the ±2 stencil)
+    gc.x = {2,2};
+    gc.y = {2,2};
 
     // Deposit charge on device
     grid<float> charge( particles -> ntiles, particles -> nx, gc );

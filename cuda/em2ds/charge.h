@@ -61,10 +61,15 @@ class Charge {
         dx( { box.x / ( nx.x * ntiles.x ), box.y / ( nx.y * ntiles.y ) } ),
         dt(dt)
     {
-        // Guard cells (1 below, 2 above)
         bnd<unsigned int> gc;
-        gc.x = {1,2};
-        gc.y = {1,2};
+
+        // Linear Shape (1 below, 2 above)
+        // gc.x = {1,2};
+        // gc.y = {1,2};
+
+        // Quartic Shape (3 each side: ±2 stencil + mid-step cell shift)
+        gc.x = {3,3};
+        gc.y = {3,3};
 
         rho = new grid<float> ( ntiles, nx, gc );
         rho -> name = "Charge";

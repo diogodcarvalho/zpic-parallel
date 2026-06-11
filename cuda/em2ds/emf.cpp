@@ -26,11 +26,16 @@ EMF::EMF( uint2 const ntiles, uint2 const nx, float2 const box,
         exit(-1);
     }
 
-    // Guard cells (1 below, 2 above)
     // These are required for the Yee solver AND for field interpolation
     bnd<unsigned int> gc;
-    gc.x = {1,2};
-    gc.y = {1,2};
+
+    // Linear Shape (1 below, 2 above)
+    // gc.x = {1,2};
+    // gc.y = {1,2};
+
+    // Quartic Shape (2 each side for the ±2 interpolation stencil)
+    gc.x = {2,2};
+    gc.y = {2,2};
 
     E = new vec3grid<float3> ( ntiles, nx, gc );
     E -> name = "Electric field";
