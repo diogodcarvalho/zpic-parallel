@@ -1116,13 +1116,280 @@ void Species::push( vec3grid<float3> * const E, vec3grid<float3> * const B )
         break;
     case( species :: boris ):
         block::set_shmem_size( kernel::push <species::boris>, shm_size );
-        kernel::push <species::boris> <<< grid, block, shm_size >>> ( 
+        kernel::push <species::boris> <<< grid, block, shm_size >>> (
             *particles, E->d_buffer, B->d_buffer,
-            E->ntiles, E->ext_nx, E->offset, 
+            E->ntiles, E->ext_nx, E->offset,
             alpha, d_energy
         );
         break;
     }
+}
+
+namespace kernel {
+
+/**
+ * @brief Deposit the four Darwin moment grids for a single particle
+ *
+ * Computes the quartic weights once and deposits all four grids in a single
+ * stencil pass.
+ *
+ * @param J         Centered current buffer (points to cell (0,0) of the tile)
+ * @param A         Acceleration density buffer
+ * @param M1        Velocity flux diagonal buffer
+ * @param M2        Velocity flux off-diagonal buffer
+ * @param ystride   y-stride (shared by the four grids)
+ * @param ix        Particle cell index
+ * @param x         Particle position inside cell
+ * @param j         Centered current to deposit into J
+ * @param a         Acceleration density to deposit into A
+ * @param m1        Velocity flux diagonal to deposit into M1
+ * @param m2        Velocity flux off-diagonal to deposit into M2
+ */
+__device__ inline void dep_darwin_moments(
+    float3 * const __restrict__ J,  float3 * const __restrict__ A,
+    float3 * const __restrict__ M1, float3 * const __restrict__ M2,
+    const int ystride, int2 ix, float2 x,
+    float3 j, float3 a, float3 m1, float3 m2 )
+{
+    float sx[5], sy[5];
+    // Extra offset needed for even-order shape function since they are centered
+    // with respect to nearest cell corner and not grid cell.
+    const int ix_offset = spline_s4( x.x, sx );
+    const int iy_offset = spline_s4( x.y, sy );
+
+    const int idx = ( ix.y + iy_offset ) * ystride + ( ix.x + ix_offset );
+
+    for ( int jj = -2; jj < 3; jj++ ) {
+        for ( int ii = -2; ii < 3; ii++ ) {
+            const float s = sx[ii + 2] * sy[jj + 2];
+            const int k = idx + ii + jj * ystride;
+
+            device::atomic_fetch_add( & J[k].x, s * j.x );
+            device::atomic_fetch_add( & J[k].y, s * j.y );
+            device::atomic_fetch_add( & J[k].z, s * j.z );
+
+            device::atomic_fetch_add( & A[k].x, s * a.x );
+            device::atomic_fetch_add( & A[k].y, s * a.y );
+            device::atomic_fetch_add( & A[k].z, s * a.z );
+
+            device::atomic_fetch_add( & M1[k].x, s * m1.x );
+            device::atomic_fetch_add( & M1[k].y, s * m1.y );
+            device::atomic_fetch_add( & M1[k].z, s * m1.z );
+
+            device::atomic_fetch_add( & M2[k].x, s * m2.x );
+            device::atomic_fetch_add( & M2[k].y, s * m2.y );
+            device::atomic_fetch_add( & M2[k].z, s * m2.z );
+        }
+    }
+}
+
+__global__
+/**
+ * @brief Kernel to deposit the time-centered Darwin moments
+ *
+ * Performs a tentative Boris push v(t-dt/2) -> v(t+dt/2) without storing it, then
+ * deposits the centered velocity moments at the frozen position x(t).
+ * 
+ * Could be optimized to minimize clashes by writing to local buffer copies instead of 
+ * global moment buffers (not a priority since it is only used at t=0).
+ *
+ * @param part          Particle data
+ * @param q             Particle charge
+ * @param alpha         Boris push coefficient ( 0.5 dt / (m/q) )
+ * @param dt            Time step (for the dv/dt centered difference)
+ * @param E_buffer      E field buffer
+ * @param B_buffer      B field buffer
+ * @param fld_offset    Offset to cell (0,0) in the field tile
+ * @param fld_ext_nx    Field tile size (includes guard cells)
+ * @param J_buffer      [out] centered current density    q v(t)
+ * @param A_buffer      [out] acceleration density        q dv/dt(t)
+ * @param M1_buffer     [out] velocity flux diagonal      q (vx^2, vy^2, vz^2)
+ * @param M2_buffer     [out] velocity flux off-diagonal  q (vx vy, vx vz, vy vz)
+ * @param mom_offset    Offset to cell (0,0) in the moment tile
+ * @param mom_ext_nx    Moment tile size (includes guard cells)
+ */
+void deposit_darwin_moments(
+    ParticleData const part, const float q, const float alpha, const float dt,
+    float3 const * const __restrict__ E_buffer,
+    float3 const * const __restrict__ B_buffer,
+    int const fld_offset, uint2 const fld_ext_nx,
+    float3 * const __restrict__ J_buffer,  float3 * const __restrict__ A_buffer,
+    float3 * const __restrict__ M1_buffer, float3 * const __restrict__ M2_buffer,
+    int const mom_offset, uint2 const mom_ext_nx )
+{
+    const int2 tile_idx = make_int2( blockIdx.x, blockIdx.y );
+    const int tile_id   = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const int fld_ystride   = fld_ext_nx.x;
+    const int mom_ystride   = mom_ext_nx.x;
+    const auto fld_tile_vol = roundup4( fld_ext_nx.x * fld_ext_nx.y );
+    const auto mom_tile_vol = roundup4( mom_ext_nx.x * mom_ext_nx.y );
+
+    float3 const * const __restrict__ E = & E_buffer[ tile_id * fld_tile_vol + fld_offset ];
+    float3 const * const __restrict__ B = & B_buffer[ tile_id * fld_tile_vol + fld_offset ];
+
+    float3 * const __restrict__ J  = & J_buffer [ tile_id * mom_tile_vol + mom_offset ];
+    float3 * const __restrict__ A  = & A_buffer [ tile_id * mom_tile_vol + mom_offset ];
+    float3 * const __restrict__ M1 = & M1_buffer[ tile_id * mom_tile_vol + mom_offset ];
+    float3 * const __restrict__ M2 = & M2_buffer[ tile_id * mom_tile_vol + mom_offset ];
+
+    const int p_offset = part.offset[ tile_id ];
+    const int np       = part.np[ tile_id ];
+    int2   const * __restrict__ const ix = &part.ix[ p_offset ];
+    float2 const * __restrict__ const x  = &part.x[ p_offset ];
+    float3 const * __restrict__ const u  = &part.u[ p_offset ];
+
+    const float rdt = 1.0f / dt;
+
+    for( int i = block_thread_rank(); i < np; i += block_num_threads() ) {
+
+        // Interpolate fields at the frozen position
+        float3 e, b;
+        interpolate_fld( E, B, fld_ystride, ix[i], x[i], e, b );
+
+        // Tentative Boris push (NOT stored): v(t-dt/2) -> v(t+dt/2)
+        float3 const u0 = u[i];
+        double energy = 0;
+        float3 const u1 = dudt_boris( alpha, e, b, u0, energy );
+
+        // Convert momenta to velocities
+        float const rg0 = rgamma( u0 );
+        float const rg1 = rgamma( u1 );
+        float3 const v0 = make_float3( u0.x * rg0, u0.y * rg0, u0.z * rg0 );
+        float3 const v1 = make_float3( u1.x * rg1, u1.y * rg1, u1.z * rg1 );
+
+        // Time-centered velocity and acceleration
+        float3 const v    = make_float3( 0.5f * ( v1.x + v0.x ), 0.5f * ( v1.y + v0.y ), 0.5f * ( v1.z + v0.z ) );
+        float3 const dvdt = make_float3( ( v1.x - v0.x ) * rdt, ( v1.y - v0.y ) * rdt, ( v1.z - v0.z ) * rdt );
+
+        const float3 j  = make_float3( q * v.x, q * v.y, q * v.z );
+        const float3 a  = make_float3( q * dvdt.x, q * dvdt.y, q * dvdt.z );
+        const float3 m1 = make_float3( q * v.x * v.x, q * v.y * v.y, q * v.z * v.z );
+        const float3 m2 = make_float3( q * v.x * v.y, q * v.x * v.z, q * v.y * v.z );
+
+        dep_darwin_moments( J, A, M1, M2, mom_ystride, ix[i], x[i], j, a, m1, m2 );
+    }
+}
+
+}
+
+/**
+ * @brief Deposit the time-centered Darwin moments
+ *
+ * @param E     Electric field (real space, at current Darwin iteration)
+ * @param B     Magnetic field (real space, at current Darwin iteration)
+ * @param J     [out] centered current density
+ * @param A     [out] acceleration density
+ * @param M1    [out] velocity flux tensor (diagonal components)
+ * @param M2    [out] velocity flux tensor (off-diagonal components)
+ */
+void Species::deposit_darwin_moments(
+    vec3grid<float3> * const E, vec3grid<float3> * const B,
+    vec3grid<float3> * const J, vec3grid<float3> * const A,
+    vec3grid<float3> * const M1, vec3grid<float3> * const M2 ) const
+{
+    const float alpha = 0.5 * dt / m_q;
+
+    dim3 grid( particles -> ntiles.x, particles -> ntiles.y );
+    auto block = 64;
+
+    kernel::deposit_darwin_moments <<< grid, block >>> (
+        *particles, q, alpha, dt,
+        E->d_buffer, B->d_buffer, E->offset, E->ext_nx,
+        J->d_buffer, A->d_buffer, M1->d_buffer, M2->d_buffer,
+        J->offset, J->ext_nx
+    );
+}
+
+
+namespace kernel {
+
+/**
+ * @brief Deposit a single particle's retarded current using a quartic shape
+ *
+ * @param V         Current buffer (points to cell (0,0) of the tile)
+ * @param ystride   y-stride for V
+ * @param ix        Particle cell index
+ * @param x         Particle position inside cell
+ * @param val       Retarded current q v(t-dt/2) to deposit
+ */
+__device__ inline void dep_darwin_retarded_current(
+    float3 * const __restrict__ V, const int ystride, int2 ix, float2 x, float3 val )
+{
+    float sx[5], sy[5];
+    // Extra offset needed for even-order shape function since they are centered
+    // with respect to nearest cell corner and not grid cell.
+    const int ix_offset = spline_s4( x.x, sx );
+    const int iy_offset = spline_s4( x.y, sy );
+
+    const int idx = ( ix.y + iy_offset ) * ystride + ( ix.x + ix_offset );
+
+    for ( int jj = -2; jj < 3; jj++ ) {
+        for ( int ii = -2; ii < 3; ii++ ) {
+            const float s = sx[ii + 2] * sy[jj + 2];
+            const int k = idx + ii + jj * ystride;
+
+            device::atomic_fetch_add( & V[k].x, s * val.x );
+            device::atomic_fetch_add( & V[k].y, s * val.y );
+            device::atomic_fetch_add( & V[k].z, s * val.z );
+        }
+    }
+}
+
+__global__
+/**
+ * @brief Kernel to deposit the retarded current q v(t-dt/2) at x(t)
+ * 
+ * Could be optimized to minimize clashes by writing to local buffer copy instead of 
+ * global current buffer (not a priority since it is only used at t=0).
+ *
+ * @param part          Particle data
+ * @param q             Particle charge
+ * @param J_buffer      Current buffer
+ * @param J_offset      Offset to cell (0,0) in the current tile
+ * @param ext_nx        Current tile size (includes guard cells)
+ */
+void deposit_darwin_retarded_current(
+    ParticleData const part, const float q,
+    float3 * const __restrict__ J_buffer, int const J_offset, uint2 const ext_nx )
+{
+    const int2 tile_idx = make_int2( blockIdx.x, blockIdx.y );
+    const int tile_id   = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const int ystride   = ext_nx.x;
+    const auto tile_vol = roundup4( ext_nx.x * ext_nx.y );
+    float3 * const __restrict__ J = & J_buffer[ tile_id * tile_vol + J_offset ];
+
+    const int p_offset = part.offset[ tile_id ];
+    const int np       = part.np[ tile_id ];
+    int2   const * __restrict__ const ix = &part.ix[ p_offset ];
+    float2 const * __restrict__ const x  = &part.x[ p_offset ];
+    float3 const * __restrict__ const u  = &part.u[ p_offset ];
+
+    for( int i = block_thread_rank(); i < np; i += block_num_threads() ) {
+        const float rg = rgamma( u[i] );
+        dep_darwin_retarded_current( J, ystride, ix[i], x[i],
+                  make_float3( q * u[i].x * rg, q * u[i].y * rg, q * u[i].z * rg ) );
+    }
+}
+
+}
+
+/**
+ * @brief Deposit the retarded current q v(t-dt/2) at x(t)
+ *
+ * Used only to seed the Darwin magnetic field at t=0.
+ *
+ * @param J     Current density grid
+ */
+void Species::deposit_darwin_retarded_current( vec3grid<float3> * const J ) const
+{
+    dim3 grid( particles -> ntiles.x, particles -> ntiles.y );
+    auto block = 64;
+
+    kernel::deposit_darwin_retarded_current <<< grid, block >>> (
+        *particles, q, J->d_buffer, J->offset, J->ext_nx
+    );
 }
 
 namespace kernel {

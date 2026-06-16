@@ -274,6 +274,157 @@ void update_fE( fft::complex64 * const __restrict__ d_fE,
     }
 }
 
+__global__
+/**
+ * @brief Update the magnetostatic (Darwin) magnetic field from the current
+ *
+ * B = i (k x J) / k^2  (with k_z = 0)
+ *
+ * @param fB    [out] Fourier transform of magnetic field
+ * @param fJ    Fourier transform of (centered) current density
+ * @param dims  Global grid dimensions
+ * @param dk    k-space cell size
+ */
+void update_fB_darwin(
+    fft::complex64 * const __restrict__ d_fB,
+    fft::complex64 const * const __restrict__ d_fJ,
+    uint2 const dims, float2 const dk )
+{
+    fft::complex64 * const __restrict__ fBx = & d_fB[                   0 ];
+    fft::complex64 * const __restrict__ fBy = & d_fB[     dims.x * dims.y ];
+    fft::complex64 * const __restrict__ fBz = & d_fB[ 2 * dims.x * dims.y ];
+
+    fft::complex64 const * const __restrict__ fJx = & d_fJ[                   0 ];
+    fft::complex64 const * const __restrict__ fJy = & d_fJ[     dims.x * dims.y ];
+    fft::complex64 const * const __restrict__ fJz = & d_fJ[ 2 * dims.x * dims.y ];
+
+    const int iy   = blockIdx.x;
+    const float ky = ((iy < int(dims.y/2)) ? iy : (iy - int(dims.y)) ) * dk.y;
+
+    const int stride = dims.x;
+    for( auto ix = block_thread_rank(); ix < dims.x; ix += block_num_threads() ) {
+        auto idx = iy * stride + ix;
+
+        const float kx = ix * dk.x;
+        const float k2 = kx*kx + ky*ky;
+        const float β  = ( k2 > 0 ) ? 1.f / k2 : 0;
+
+        fBx[idx] = fft::I * (  ky * fJz[idx]                  ) * β;
+        fBy[idx] = fft::I * ( -kx * fJz[idx]                  ) * β;
+        fBz[idx] = fft::I * (  kx * fJy[idx] - ky * fJx[idx]  ) * β;
+    }
+}
+
+__global__
+/**
+ * @brief Update the transverse (Darwin) electric field via the shifted Helmholtz
+ *        equation
+ *
+ * Computes:
+ *      dJ/dt = A - i k.M
+ * Transverse-projects it, and solves:
+ *      E_T = -1/(k^2 + wp2) [ dJ_T/dt - wp2 E_T_old ] 
+ * 
+ * @param fEt    [in,out] Fourier transform of transverse E-field
+ * @param fA     Fourier transform of acceleration density
+ * @param fM1    Fourier transform of velocity flux (diagonal)
+ * @param fM2    Fourier transform of velocity flux (off-diagonal)
+ * @param dims   Global grid dimensions
+ * @param dk     k-space cell size
+ * @param wp2    Reference background plasma frequency squared
+ * @param d_res  [out] Accumulated squared change in E_T
+ * @param d_norm [out] Accumulated squared magnitude of E_T (new iterate)
+ */
+void update_fEt_darwin(
+    fft::complex64 * const __restrict__ d_fEt,
+    fft::complex64 const * const __restrict__ d_fA,
+    fft::complex64 const * const __restrict__ d_fM1,
+    fft::complex64 const * const __restrict__ d_fM2,
+    uint2 const dims, float2 const dk, float const wp2,
+    double * const __restrict__ d_res, double * const __restrict__ d_norm )
+{
+    fft::complex64 * const __restrict__ fEtx = & d_fEt[                   0 ];
+    fft::complex64 * const __restrict__ fEty = & d_fEt[     dims.x * dims.y ];
+    fft::complex64 * const __restrict__ fEtz = & d_fEt[ 2 * dims.x * dims.y ];
+
+    fft::complex64 const * const __restrict__ fAx = & d_fA[                   0 ];
+    fft::complex64 const * const __restrict__ fAy = & d_fA[     dims.x * dims.y ];
+    fft::complex64 const * const __restrict__ fAz = & d_fA[ 2 * dims.x * dims.y ];
+
+    // M1 = { Mxx, Myy, Mzz }; Mzz is not needed (k_z = 0 always)
+    fft::complex64 const * const __restrict__ fMxx = & d_fM1[                   0 ];
+    fft::complex64 const * const __restrict__ fMyy = & d_fM1[     dims.x * dims.y ];
+    // M2 = { Mxy, Mxz, Myz }
+    fft::complex64 const * const __restrict__ fMxy = & d_fM2[                   0 ];
+    fft::complex64 const * const __restrict__ fMxz = & d_fM2[     dims.x * dims.y ];
+    fft::complex64 const * const __restrict__ fMyz = & d_fM2[ 2 * dims.x * dims.y ];
+
+    const int iy   = blockIdx.x;
+    const float ky = ((iy < int(dims.y/2)) ? iy : (iy - int(dims.y)) ) * dk.y;
+
+    const int stride = dims.x;
+
+    double res = 0;
+    double nrm = 0;
+
+    for( auto ix = block_thread_rank(); ix < dims.x; ix += block_num_threads() ) {
+        auto idx = iy * stride + ix;
+
+        const float kx = ix * dk.x;
+        const float k2 = kx*kx + ky*ky;
+
+        // dJ/dt = A - i k.M  (with k_z = 0)
+        const fft::complex64 kMx = kx * fMxx[idx] + ky * fMxy[idx];
+        const fft::complex64 kMy = kx * fMxy[idx] + ky * fMyy[idx];
+        const fft::complex64 kMz = kx * fMxz[idx] + ky * fMyz[idx];
+
+        const fft::complex64 djx = fAx[idx] - fft::I * kMx;
+        const fft::complex64 djy = fAy[idx] - fft::I * kMy;
+        const fft::complex64 djz = fAz[idx] - fft::I * kMz;
+
+        // Transverse projection of dJ/dt
+        const fft::complex64 kdj  = kx * djx + ky * djy;
+        const fft::complex64 djtx = ( k2 > 0 ) ? djx - kx * kdj / k2 : fft::complex64(0);
+        const fft::complex64 djty = ( k2 > 0 ) ? djy - ky * kdj / k2 : fft::complex64(0);
+        const fft::complex64 djtz = djz;
+
+        const fft::complex64 Etx_old = fEtx[idx];
+        const fft::complex64 Ety_old = fEty[idx];
+        const fft::complex64 Etz_old = fEtz[idx];
+
+        // Shifted Helmholtz solve; k=0 mode is left at zero
+        const float β = ( k2 > 0 ) ? 1.f / ( k2 + wp2 ) : 0;
+
+        const fft::complex64 Etx_new = -( djtx - wp2 * Etx_old ) * β;
+        const fft::complex64 Ety_new = -( djty - wp2 * Ety_old ) * β;
+        const fft::complex64 Etz_new = -( djtz - wp2 * Etz_old ) * β;
+
+        fEtx[idx] = Etx_new;
+        fEty[idx] = Ety_new;
+        fEtz[idx] = Etz_new;
+
+        const fft::complex64 dEx = Etx_new - Etx_old;
+        const fft::complex64 dEy = Ety_new - Ety_old;
+        const fft::complex64 dEz = Etz_new - Etz_old;
+
+        // Residuals are useful to check convergence
+        res += double( dEx.x * dEx.x + dEx.y * dEx.y )
+             + double( dEy.x * dEy.x + dEy.y * dEy.y )
+             + double( dEz.x * dEz.x + dEz.y * dEz.y );
+
+        nrm += double( Etx_new.x * Etx_new.x + Etx_new.y * Etx_new.y )
+             + double( Ety_new.x * Ety_new.x + Ety_new.y * Ety_new.y )
+             + double( Etz_new.x * Etz_new.x + Etz_new.y * Etz_new.y );
+    }
+
+    res = warp::reduce_add( res );
+    nrm = warp::reduce_add( nrm );
+    if ( warp::thread_rank() == 0 ) {
+        device::atomic_fetch_add( d_res,  res );
+        device::atomic_fetch_add( d_norm, nrm );
+    }
+}
+
 }
 
 /**
@@ -337,40 +488,92 @@ void EMF::advance( Current & current, Charge & charge ) {
 }
 
 /**
- * @brief Set EM fields at t=0
+ * @brief Solve the longitudinal (Poisson) electric field
  *
- * @param type      Initialization type
  * @param charge    Charge object with frho already populated
  */
-void EMF::set_init_fields( emf::init_type::type type, Charge & charge ) {
+void EMF::poisson_solver( Charge & charge ) {
 
-    if ( iter != 0 ) {
-        ABORT( "EMF::set_init_fields() may only be called at iter = 0" );
-    }
+    // fE = E_L(rho) + fEt. With fEt = 0 (the t=0 seed) this is a pure Poisson
+    // solve; during the Darwin iteration fEt carries the transverse field.
+    kernel::update_fE <<< fE -> dims.y, 256 >>> (
+        reinterpret_cast<fft::complex64 *>( fE  -> d_buffer ),
+        reinterpret_cast<fft::complex64 *>( fEt -> d_buffer ),
+        reinterpret_cast<fft::complex64 *>( charge.frho -> d_buffer ),
+        fE -> dims, fft::dk( box )
+    );
 
-    switch ( type ) {
-        case emf::init_type::poisson:
+    // Transform to real-space E and update guard cells
+    fft_backward -> transform( *fE, *E );
+    E -> copy_to_gc();
+}
 
-            // Compute fE from frho (fEt = 0 at init, so this is pure Poisson)
-            kernel::update_fE <<< fE -> dims.y, 256 >>> (
-                reinterpret_cast<fft::complex64 *>( fE  -> d_buffer ),
-                reinterpret_cast<fft::complex64 *>( fEt -> d_buffer ),
-                reinterpret_cast<fft::complex64 *>( charge.frho -> d_buffer ),
-                fE -> dims, fft::dk( box )
-            );
+/**
+ * @brief Solve the magnetostatic (Darwin) B
+ *
+ * @param fJ    k-space current
+ */
+void EMF::darwin_solver_B( basic_grid3<std::complex<float>> & fJ )
+{
+    kernel::update_fB_darwin <<< fB -> dims.y, 256 >>> (
+        reinterpret_cast<fft::complex64 *>( fB -> d_buffer ),
+        reinterpret_cast<fft::complex64 *>( fJ.d_buffer ),
+        fB -> dims, fft::dk( box )
+    );
 
-            // Transform to real-space E
-            fft_backward -> transform( *fE, *E );
+    // Transform B to real space so the next tentative push sees the new value
+    fft_backward -> transform( *fB, *B );
+    B -> copy_to_gc();
+}
 
-            // Update guard cell values
-            E -> copy_to_gc();
+/**
+ * @brief Solve the Darwin (magnetostatic / radiation-free) fields
+ *
+ * @param fJ        k-space centered current
+ * @param fA        k-space acceleration density
+ * @param fM1       k-space velocity flux (diagonal)
+ * @param fM2       k-space velocity flux (off-diagonal)
+ * @param charge    Charge object (for the fixed longitudinal field)
+ * @param wp2       Reference background plasma frequency squared
+ * @return double   Relative L2 change of E_T ( |dEt| / |Et| )
+ */
+double EMF::darwin_solver(
+    basic_grid3<std::complex<float>> & fJ,
+    basic_grid3<std::complex<float>> & fA,
+    basic_grid3<std::complex<float>> & fM1,
+    basic_grid3<std::complex<float>> & fM2,
+    Charge & charge,
+    float const wp2 )
+{
+    const float2 dk = fft::dk( box );
 
-            break;
+    // Magnetostatic B from the centered current
+    darwin_solver_B( fJ );
 
-        case emf::init_type::none:
-        default:
-            break;
-    }
+    // Accumulator for the squared change in E_T (acc[0]) and the squared magnitude of 
+    // E_T (acc[1]).
+    double * d_acc = device::malloc<double>( 2 );
+    device::zero( d_acc, 2 );
+
+    // Shifted Helmholtz solve for the transverse E. 
+    kernel::update_fEt_darwin <<< fEt -> dims.y, 256 >>> (
+        reinterpret_cast<fft::complex64 *>( fEt -> d_buffer ),
+        reinterpret_cast<fft::complex64 *>( fA.d_buffer ),
+        reinterpret_cast<fft::complex64 *>( fM1.d_buffer ),
+        reinterpret_cast<fft::complex64 *>( fM2.d_buffer ),
+        fEt -> dims, dk, wp2, &d_acc[0], &d_acc[1]
+    );
+
+    // Reconstruct the total E = E_L(rho) + E_T (and transform to real space)
+    poisson_solver( charge );
+
+    double acc[2];
+    device::memcpy_tohost( acc, d_acc, 2 );
+    device::free( d_acc );
+
+    // Relative L2 change of the transverse field (falls back to absolute if
+    // E_T is still identically zero, e.g. the first pass with no current)
+    return ( acc[1] > 0 ) ? std::sqrt( acc[0] / acc[1] ) : std::sqrt( acc[0] );
 }
 
 /**

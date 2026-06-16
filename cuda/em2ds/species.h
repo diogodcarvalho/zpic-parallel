@@ -354,10 +354,54 @@ public:
 
     /**
      * @brief Deposit species charge
-     * 
+     *
      * @param charge    Charge density grid
      */
     void deposit_charge( grid<float> &charge ) const;
+
+    /**
+     * @brief Deposit the time-centered Darwin moments
+     *
+     * A tentative Boris push v(t-dt/2) -> v(t+dt/2) is performed using the supplied 
+     * fields but the particle momentum is NOT written back. The time-centered velocity 
+     * v(t) and acceleration dv/dt(t) are then used to deposit, at the (frozen) particle 
+     * position x(t):
+     * 
+     *  - J  : centered current         q v(t)
+     *  - A  : acceleration density     q dv/dt(t)
+     *  - M1 : velocity flux diagonal   q (vx^2, vy^2, vz^2)
+     *  - M2 : velocity flux off-diag.  q (vx vy, vx vz, vy vz)
+     *
+     * @param E     Electric field (real space, at current Darwin iteration)
+     * @param B     Magnetic field (real space, at current Darwin iteration)
+     * @param J     [out] centered current density
+     * @param A     [out] acceleration density
+     * @param M1    [out] velocity flux tensor (diagonal components)
+     * @param M2    [out] velocity flux tensor (off-diagonal components)
+     */
+    void deposit_darwin_moments(
+        vec3grid<float3> * const E, vec3grid<float3> * const B,
+        vec3grid<float3> * const J, vec3grid<float3> * const A,
+        vec3grid<float3> * const M1, vec3grid<float3> * const M2 ) const;
+
+    /**
+     * @brief Deposit the retarded current q v(t-dt/2) at x(t) 
+     * 
+     * Used only to seed the Darwin magnetic field at t=0.
+     *
+     * @param J     Current density grid
+     */
+    void deposit_darwin_retarded_current( vec3grid<float3> * const J ) const;
+
+    /**
+     * @brief Per-species contribution to the background plasma frequency squared
+     *
+     * Returns (q/m_q) n0 = (q^2/m) n0, used as the implicit reference term
+     * omega_p0^2 in the Darwin transverse-field (shifted Helmholtz) solve.
+     *
+     * @return double
+     */
+    double darwin_wp2() const { return density->n0 * ( double(q) / m_q ); }
 
     /**
      * @brief Returns total time centered kinetic energy

@@ -33,16 +33,16 @@ class Current {
     /// @brief Iteration number
     int iter;
 
-    /// @brief FFT plan
-    fft::plan * fft_forward;
-
     /**
      * @brief Process boundary conditions
-     * 
+     *
      */
     void process_bc();
 
     public:
+
+    /// @brief FFT plan
+    fft::plan * fft_forward;
 
     /// @brief Current density
     vec3grid<float3> * J;
@@ -154,8 +154,14 @@ class Current {
     void advance();
 
     /**
+     * @brief Reset iteration counter to zero
+     *
+     */
+    void reset_iter() { iter = 0; }
+
+    /**
      * @brief Zero electric current values
-     * 
+     *
      */
     void zero() {
         J -> zero();

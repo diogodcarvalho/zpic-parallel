@@ -363,6 +363,8 @@ void test_sparse( std::string param ) {
     bool   filter  = true;               // apply digital filtering to current/charge
     unsigned seed  = 0;                  // RNG seed offset (vary for independent replicas)
     uint  save_part = 1;                 // dump particle phase space at each diag (0 = energy only, e.g. warm-up probe)
+    std::string init = "poisson";        // field initialization: poisson | darwin | none
+    uint  darwin_iter = 2;               // number of Darwin bootstrap passes (init=darwin only)
 
     // Parse whitespace-separated "key=value" pairs. 
     // Vector values are comma-separated, e.g. "ntiles=4,4" or "uth=0.1,0,0".
@@ -378,22 +380,24 @@ void test_sparse( std::string param ) {
         std::string val = tok.substr( eq + 1 );
 
         int got, want;
-        if      ( key == "ntiles"  ) { got = std::sscanf( val.c_str(), "%u,%u",    &ntiles.x, &ntiles.y );   want = 2; }
-        else if ( key == "nx"      ) { got = std::sscanf( val.c_str(), "%u,%u",    &nx.x, &nx.y );           want = 2; }
-        else if ( key == "dx"      ) { got = std::sscanf( val.c_str(), "%f",       &dx );                    want = 1; }
-        else if ( key == "dt"      ) { got = std::sscanf( val.c_str(), "%f",       &dt );                    want = 1; }
-        else if ( key == "uth"     ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &uth.x, &uth.y, &uth.z ); want = 3; }
-        else if ( key == "ufl"     ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &ufl.x, &ufl.y, &ufl.z ); want = 3; }
-        else if ( key == "n_dump"  ) { got = std::sscanf( val.c_str(), "%u",       &n_dump );                want = 1; }
-        else if ( key == "n_skip"  ) { got = std::sscanf( val.c_str(), "%u",       &n_skip );                want = 1; }
-        else if ( key == "tmax"    ) { got = std::sscanf( val.c_str(), "%f",       &tmax );                  want = 1; }
-        else if ( key == "dx_part" ) { got = std::sscanf( val.c_str(), "%f",       &dx_part );               want = 1; }
-        else if ( key == "spacing" ) { got = std::sscanf( val.c_str(), "%u,%u",    &spacing.x, &spacing.y ); want = 2; }
-        else if ( key == "ppc"     ) { got = std::sscanf( val.c_str(), "%u,%u",    &ppc.x, &ppc.y );
-                                       if ( got == 1 ) { ppc.y = ppc.x; got = 2; }                          want = 2; }
-        else if ( key == "filter"  ) { int b; got = std::sscanf( val.c_str(), "%d", &b ); filter = ( b != 0 ); want = 1; }
-        else if ( key == "seed"    ) { got = std::sscanf( val.c_str(), "%u",       &seed );                  want = 1; }
-        else if ( key == "save_part") { got = std::sscanf( val.c_str(), "%u",       &save_part );             want = 1; }
+        if      ( key == "ntiles"     ) { got = std::sscanf( val.c_str(), "%u,%u",    &ntiles.x, &ntiles.y );   want = 2; }
+        else if ( key == "nx"         ) { got = std::sscanf( val.c_str(), "%u,%u",    &nx.x, &nx.y );           want = 2; }
+        else if ( key == "dx"         ) { got = std::sscanf( val.c_str(), "%f",       &dx );                    want = 1; }
+        else if ( key == "dt"         ) { got = std::sscanf( val.c_str(), "%f",       &dt );                    want = 1; }
+        else if ( key == "uth"        ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &uth.x, &uth.y, &uth.z ); want = 3; }
+        else if ( key == "ufl"        ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &ufl.x, &ufl.y, &ufl.z ); want = 3; }
+        else if ( key == "n_dump"     ) { got = std::sscanf( val.c_str(), "%u",       &n_dump );                want = 1; }
+        else if ( key == "n_skip"     ) { got = std::sscanf( val.c_str(), "%u",       &n_skip );                want = 1; }
+        else if ( key == "tmax"       ) { got = std::sscanf( val.c_str(), "%f",       &tmax );                  want = 1; }
+        else if ( key == "dx_part"    ) { got = std::sscanf( val.c_str(), "%f",       &dx_part );               want = 1; }
+        else if ( key == "spacing"    ) { got = std::sscanf( val.c_str(), "%u,%u",    &spacing.x, &spacing.y ); want = 2; }
+        else if ( key == "ppc"        ) { got = std::sscanf( val.c_str(), "%u,%u",    &ppc.x, &ppc.y );
+                                          if ( got == 1 ) { ppc.y = ppc.x; got = 2; }                             want = 2; }
+        else if ( key == "filter"     ) { int b; got = std::sscanf( val.c_str(), "%d", &b ); filter = ( b != 0 ); want = 1; }
+        else if ( key == "seed"       ) { got = std::sscanf( val.c_str(), "%u",       &seed );                    want = 1; }
+        else if ( key == "save_part"  ) { got = std::sscanf( val.c_str(), "%u",       &save_part );               want = 1; }
+        else if ( key == "init"       ) { init = val; got = 1;                                                    want = 1; }
+        else if ( key == "darwin_iter") { got = std::sscanf( val.c_str(), "%u",       &darwin_iter );             want = 1; }
         else {
             std::cerr << "Unknown parameter key: '" << key << "'\n";
             std::exit(1);
@@ -425,6 +429,17 @@ void test_sparse( std::string param ) {
     std::cout << "filter    : " << ( filter ? "on" : "off" ) << '\n';
     std::cout << "seed      : " << seed    << '\n';
     std::cout << "save_part : " << save_part << '\n';
+    std::cout << "init      : " << init    << ( init == "darwin" ? " (iter=" + std::to_string(darwin_iter) + ")" : "" ) << '\n';
+
+    // Map the init string to the field initialization type
+    emf::init_type::type init_type;
+    if      ( init == "poisson" ) init_type = emf::init_type::poisson;
+    else if ( init == "darwin"  ) init_type = emf::init_type::darwin;
+    else if ( init == "none"    ) init_type = emf::init_type::none;
+    else {
+        std::cerr << "Unknown init type: '" << init << "' (expected poisson, darwin or none)\n";
+        std::exit(1);
+    }
 
     Simulation sim( ntiles, nx, box, dt );
 
@@ -436,8 +451,8 @@ void test_sparse( std::string param ) {
         sim.charge.filter = new Filter::None();
     }
 
-    // When a ppc is given, fall back to uniform density; otherwise the
-    // sparse/lattice profiles place one particle per density site (ppc 1,1).
+    // When a ppc is given, fall back to uniform density. 
+    // Otherwise the sparse/lattice profiles place one particle per density site.
     bool uniform = ( ppc.x > 0 && ppc.y > 0 );
     if ( ! uniform ) ppc = uint2{ 1, 1 };
 
@@ -461,25 +476,25 @@ void test_sparse( std::string param ) {
 
     sim.add_species( electrons );
 
-    // Initialize fields via Poisson solve from initial charge density
-    sim.init_fields( emf::init_type::poisson );
+    // Initialize fields, must be done before first advance()
+    sim.init_fields( init_type, darwin_iter );
 
     // Lambda function for diagnostic output
     auto diag = [ & ]( ) {
-        // sim.emf.save(emf::e, fcomp::x);
-        // sim.emf.save(emf::e, fcomp::y);
-        // sim.emf.save(emf::e, fcomp::z);
+        sim.emf.save(emf::e, fcomp::x);
+        sim.emf.save(emf::e, fcomp::y);
+        sim.emf.save(emf::e, fcomp::z);
 
-        // sim.emf.save(emf::b, fcomp::x);
-        // sim.emf.save(emf::b, fcomp::y);
-        // sim.emf.save(emf::b, fcomp::z);
+        sim.emf.save(emf::b, fcomp::x);
+        sim.emf.save(emf::b, fcomp::y);
+        sim.emf.save(emf::b, fcomp::z);
 
-        // sim.current.save(fcomp::x);
-        // sim.current.save(fcomp::y);
-        // sim.current.save(fcomp::z);
+        sim.current.save(fcomp::x);
+        sim.current.save(fcomp::y);
+        sim.current.save(fcomp::z);
 
-        // sim.charge.save();
-        // electrons.save_charge();
+        sim.charge.save();
+        electrons.save_charge();
 
         if ( save_part )
             electrons.save();
@@ -488,10 +503,6 @@ void test_sparse( std::string param ) {
 
     Timer timer; timer.start();
 
-    // Optional warm-up: run the first n_skip steps without dumping (e.g. to let
-    // initial plasma oscillations settle). The first dump then lands exactly at
-    // step n_skip (t = n_skip*dt), and every n_dump steps thereafter. With
-    // n_skip = 0 this reduces to the usual dump at t = 0.
     if ( n_skip == 0 )
         diag();
 

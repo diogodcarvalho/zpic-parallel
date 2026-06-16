@@ -78,12 +78,22 @@ class Simulation {
     /**
      * @brief Initialize EM fields at t=0
      *
-     * @param type      Initialization type
+     * @param type          Initialization type
+     * @param darwin_iter   Number of Darwin bootstrap passes (only used for the
+     *                      darwin initialization type)
      */
-    void init_fields( emf::init_type::type type ) {
+    void init_fields( emf::init_type::type type, unsigned int darwin_iter = 0 ) {
 
         if ( iter != 0 ) {
             ABORT( "Simulation::init_fields() may only be called at iter = 0" );
+        }
+
+        // The spectral field solver and the guard-cell reduction assume periodic
+        // boundaries; init_fields only supports fully periodic BCs.
+        if ( ! ( emf.E->periodic.x   && emf.E->periodic.y   &&
+                 current.J->periodic.x && current.J->periodic.y &&
+                 charge.rho->periodic.x && charge.rho->periodic.y ) ) {
+            ABORT( "Simulation::init_fields() only supports periodic boundary conditions" );
         }
 
         // Zero global current and charge
@@ -102,13 +112,80 @@ class Simulation {
                 // FFT to k-space (no neutral background, Poisson kernel zeros k=0 mode)
                 charge.fft_forward -> transform( *charge.rho, *charge.frho );
 
-                // For now no filtering applied  
+                // For now no filtering applied
                 // charge.filter -> apply( *frho );
 
                 // Solve Poisson for longitudinal E-field
-                emf.set_init_fields( type, charge );
+                emf.poisson_solver( charge );
 
                 break;
+
+            case emf::init_type::darwin:
+            {
+                // Solve Poisson for the (fixed) longitudinal E-field (fEt = 0 here).
+                // Field needs set before Darwin iterations start for push calculation.
+                for ( auto & sp : species ) sp -> deposit_charge( *charge.rho );
+                charge.rho -> add_from_gc();
+                charge.fft_forward -> transform( *charge.rho, *charge.frho );
+                emf.poisson_solver( charge );
+
+                // Seed B from the retarded current q v(-dt/2) at x(0), so the
+                // first tentative push already sees a physical magnetic field.
+                for ( auto & sp : species ) sp -> deposit_darwin_retarded_current( current.J );
+                current.J -> add_from_gc();
+                current.fft_forward -> transform( *current.J, *current.fJ );
+                emf.darwin_solver_B( *current.fJ );
+
+                // Reference background plasma frequency squared (implicit term in
+                // the transverse-field shifted Helmholtz solve)
+                double wp2 = 0;
+                for ( auto & sp : species ) wp2 += sp -> darwin_wp2();
+
+                // Temporary Darwin moment grids (used for init-only).
+                // They reuse current.J's guard-cell layout and FFT plans
+                vec3grid<float3> A ( ntiles, nx, current.J->gc );
+                vec3grid<float3> M1( ntiles, nx, current.J->gc );
+                vec3grid<float3> M2( ntiles, nx, current.J->gc );
+                basic_grid3<std::complex<float>> fA ( current.fJ->dims );
+                basic_grid3<std::complex<float>> fM1( current.fJ->dims );
+                basic_grid3<std::complex<float>> fM2( current.fJ->dims );
+
+                // Repeat Darwin solver update for n steps
+                for ( unsigned int pass = 0; pass < darwin_iter; pass++ ) {
+
+                    // Zero the moment grids
+                    current.zero();
+                    A.zero();
+                    M1.zero();
+                    M2.zero();
+
+                    // Deposit time-centered Darwin moments
+                    // (this does a tentative push but particle momenta are not modified)
+                    for ( auto & sp : species )
+                        sp -> deposit_darwin_moments( emf.E, emf.B, current.J, &A, &M1, &M2 );
+
+                    // Sum partial deposits across tile boundaries
+                    current.J -> add_from_gc();
+                    A.add_from_gc();
+                    M1.add_from_gc();
+                    M2.add_from_gc();
+
+                    // FFT moments to k-space
+                    current.fft_forward -> transform( *current.J, *current.fJ );
+                    current.fft_forward -> transform( A,  fA  );
+                    current.fft_forward -> transform( M1, fM1 );
+                    current.fft_forward -> transform( M2, fM2 );
+
+                    // Solve for B and the shifted-Helmholtz transverse E
+                    double res = emf.darwin_solver(
+                        *current.fJ, fA, fM1, fM2, charge, wp2 );
+
+                    std::cout << "(*info*) Darwin init pass " << pass
+                              << " : |dEt|/|Et| = " << res << '\n';
+                }
+
+                break;
+            }
 
             case emf::init_type::none:
             default:
@@ -117,8 +194,9 @@ class Simulation {
 
         // Reset all iteration counters to 0
         charge.reset_iter();
+        current.reset_iter();
         emf.reset_iter();
-                
+
     }
 
     /**

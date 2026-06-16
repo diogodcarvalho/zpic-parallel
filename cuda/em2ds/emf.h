@@ -23,7 +23,7 @@ namespace emf {
     typedef bnd<bc::type> bc_type;
 
     namespace init_type {
-        enum type { none = 0, poisson };
+        enum type { none = 0, poisson, darwin };
     }
 }
 
@@ -166,12 +166,38 @@ class EMF {
     }
 
     /**
-     * @brief Set EM fields at t=0
+     * @brief Solve the longitudinal (Poisson) electric field
      *
-     * @param type
-     * @param charge
+     *
+     * @param charge    Charge object with frho already populated
      */
-    void set_init_fields( emf::init_type::type type, Charge & charge );
+    void poisson_solver( Charge & charge );
+
+    /**
+     * @brief Solve the magnetostatic (Darwin) B field
+     *
+     * @param fJ    k-space current
+     */
+    void darwin_solver_B( basic_grid3<std::complex<float>> & fJ );
+
+    /**
+     * @brief Solve the Darwin (magnetostatic / radiation-free) fields
+     *
+     * @param fJ        k-space centered current
+     * @param fA        k-space acceleration density
+     * @param fM1       k-space velocity flux (diagonal: Mxx, Myy, Mzz)
+     * @param fM2       k-space velocity flux (off-diagonal: Mxy, Mxz, Myz)
+     * @param charge    Charge object (for the fixed longitudinal field)
+     * @param wp2       Reference background plasma frequency squared
+     * @return double   L2 norm of the change in E_T (convergence residual)
+     */
+    double darwin_solver(
+        basic_grid3<std::complex<float>> & fJ,
+        basic_grid3<std::complex<float>> & fA,
+        basic_grid3<std::complex<float>> & fM1,
+        basic_grid3<std::complex<float>> & fM2,
+        Charge & charge,
+        float const wp2 );
 
 
     void advance( );
