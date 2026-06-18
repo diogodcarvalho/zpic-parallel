@@ -112,8 +112,9 @@ class Simulation {
                 // FFT to k-space (no neutral background, Poisson kernel zeros k=0 mode)
                 charge.fft_forward -> transform( *charge.rho, *charge.frho );
 
-                // For now no filtering applied
-                // charge.filter -> apply( *frho );
+                // Filter the k-space charge so the initial source is consistent with
+                // the one used by the PSATD advance
+                charge.filter -> apply( *charge.frho );
 
                 // Solve Poisson for longitudinal E-field
                 emf.poisson_solver( charge );
@@ -127,6 +128,10 @@ class Simulation {
                 for ( auto & sp : species ) sp -> deposit_charge( *charge.rho );
                 charge.rho -> add_from_gc();
                 charge.fft_forward -> transform( *charge.rho, *charge.frho );
+                // Filter the k-space charge to match the PSATD advance. rho is
+                // fixed during the Darwin iteration, so this single filter pass
+                // also covers the longitudinal field rebuilt inside darwin_solver.
+                charge.filter -> apply( *charge.frho );
                 emf.poisson_solver( charge );
 
                 // Seed B from the retarded current q v(-dt/2) at x(0), so the
@@ -134,10 +139,12 @@ class Simulation {
                 for ( auto & sp : species ) sp -> deposit_darwin_retarded_current( current.J );
                 current.J -> add_from_gc();
                 current.fft_forward -> transform( *current.J, *current.fJ );
+                current.filter -> apply( *current.fJ );
                 emf.darwin_solver_B( *current.fJ );
 
                 // Reference background plasma frequency squared (implicit term in
                 // the transverse-field shifted Helmholtz solve)
+                // TODO: This might need to be modified for the < 1ppc case
                 double wp2 = 0;
                 for ( auto & sp : species ) wp2 += sp -> darwin_wp2();
 
@@ -175,6 +182,14 @@ class Simulation {
                     current.fft_forward -> transform( A,  fA  );
                     current.fft_forward -> transform( M1, fM1 );
                     current.fft_forward -> transform( M2, fM2 );
+
+                    // Filter every source feeding the Darwin solve  with the same 
+                    // filter the PSATD advance applies to fJ. Filtering A and M is
+                    // equivalent to filtering dJ/dt = A - i k.M.
+                    current.filter -> apply( *current.fJ );
+                    current.filter -> apply( fA  );
+                    current.filter -> apply( fM1 );
+                    current.filter -> apply( fM2 );
 
                     // Solve for B and the shifted-Helmholtz transverse E
                     double res = emf.darwin_solver(

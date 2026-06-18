@@ -354,13 +354,15 @@ void test_sparse( std::string param ) {
     float  dx_part = 0.032f;             // sparse density spacing (same in x and y)
     uint2  spacing{ 0, 0 };              // lattice spacing in cells (overrides dx_part if set)
     uint2  ppc    { 0, 0 };              // if set, use uniform density with this ppc instead of sparse
+    float  density = 1.0f;               // plasma density (n0) for the selected profile
     float  dt      = 0.000692965f;       // time step
     uint  n_dump  = 100;                // diagnostic output interval (in number of timesteps)
     uint  n_skip  = 0;                  // warm-up steps to run before the first dump (first dump at step n_skip)
     float  tmax    = 0.002f;             // total simulation time
     float3 uth    { 0.0f, 0.0f, 0.0f };  // thermal velocity
     float3 ufl    { 0.0f, 0.0f, 0.0f };  // fluid velocity
-    bool   filter  = true;               // apply digital filtering to current/charge
+    std::string filter_mode = "lowpass"; // source filter: none | lowpass | binomial
+    unsigned filter_order = 1;           // binomial filter order (binomial only)
     unsigned seed  = 0;                  // RNG seed offset (vary for independent replicas)
     uint  save_part = 1;                 // dump particle phase space at each diag (0 = energy only, e.g. warm-up probe)
     std::string init = "poisson";        // field initialization: poisson | darwin | none
@@ -390,10 +392,16 @@ void test_sparse( std::string param ) {
         else if ( key == "n_skip"     ) { got = std::sscanf( val.c_str(), "%u",       &n_skip );                want = 1; }
         else if ( key == "tmax"       ) { got = std::sscanf( val.c_str(), "%f",       &tmax );                  want = 1; }
         else if ( key == "dx_part"    ) { got = std::sscanf( val.c_str(), "%f",       &dx_part );               want = 1; }
+        else if ( key == "density"    ) { got = std::sscanf( val.c_str(), "%f",       &density );               want = 1; }
         else if ( key == "spacing"    ) { got = std::sscanf( val.c_str(), "%u,%u",    &spacing.x, &spacing.y ); want = 2; }
         else if ( key == "ppc"        ) { got = std::sscanf( val.c_str(), "%u,%u",    &ppc.x, &ppc.y );
                                           if ( got == 1 ) { ppc.y = ppc.x; got = 2; }                             want = 2; }
-        else if ( key == "filter"     ) { int b; got = std::sscanf( val.c_str(), "%d", &b ); filter = ( b != 0 ); want = 1; }
+        else if ( key == "filter"     ) { // accept the legacy 0/1 boolean as well as a mode string
+                                          if      ( val == "0" || val == "off"     ) filter_mode = "none";
+                                          else if ( val == "1" || val == "on"      ) filter_mode = "lowpass";
+                                          else                                        filter_mode = val;
+                                          got = 1; want = 1; }
+        else if ( key == "filter_order") { got = std::sscanf( val.c_str(), "%u",       &filter_order );           want = 1; }
         else if ( key == "seed"       ) { got = std::sscanf( val.c_str(), "%u",       &seed );                    want = 1; }
         else if ( key == "save_part"  ) { got = std::sscanf( val.c_str(), "%u",       &save_part );               want = 1; }
         else if ( key == "init"       ) { init = val; got = 1;                                                    want = 1; }
@@ -408,6 +416,9 @@ void test_sparse( std::string param ) {
         }
     }
 
+    // Binomial filter order must be at least 1 (matches Filter::Binomial clamp)
+    if ( filter_order < 1 ) filter_order = 1;
+
     float2 box = dx * make_float2( ntiles.x * nx.x, ntiles.y * nx.y );
 
     std::cout << "ntiles    : " << ntiles  << '\n';
@@ -420,13 +431,14 @@ void test_sparse( std::string param ) {
         std::cout << "spacing   : " << spacing << '\n';
     else
         std::cout << "dx_part   : " << dx_part << '\n';
+    std::cout << "density   : " << density << '\n';
     std::cout << "dt        : " << dt      << '\n';
     std::cout << "n_dump    : " << n_dump  << '\n';
     std::cout << "n_skip    : " << n_skip  << " (first dump at t = " << n_skip * dt << ")\n";
     std::cout << "tmax      : " << tmax    << '\n';
     std::cout << "uth       : " << uth     << '\n';
     std::cout << "ufl       : " << ufl     << '\n';
-    std::cout << "filter    : " << ( filter ? "on" : "off" ) << '\n';
+    std::cout << "filter    : " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) + ")" : "" ) << '\n';
     std::cout << "seed      : " << seed    << '\n';
     std::cout << "save_part : " << save_part << '\n';
     std::cout << "init      : " << init    << ( init == "darwin" ? " (iter=" + std::to_string(darwin_iter) + ")" : "" ) << '\n';
@@ -441,14 +453,22 @@ void test_sparse( std::string param ) {
         std::exit(1);
     }
 
+    if ( filter_mode != "none" && filter_mode != "lowpass" && filter_mode != "binomial" ) {
+        std::cerr << "Unknown filter: '" << filter_mode << "' (expected none, lowpass or binomial)\n";
+        std::exit(1);
+    }
+
     Simulation sim( ntiles, nx, box, dt );
 
-    // Disable digital filtering of current/charge (e.g. to measure collisionality)
-    if ( ! filter ) {
-        delete sim.current.filter;
-        sim.current.filter = new Filter::None();
-        delete sim.charge.filter;
-        sim.charge.filter = new Filter::None();
+    // Override the default brick-wall Lowpass on current/charge with the requested
+    // source filter (none to measure collisionality, or binomial to avoid the Gibbs
+    // ringing the hard spectral cut introduces in the fields).
+    if ( filter_mode == "none" ) {
+        sim.current.set_filter( Filter::None() );
+        sim.charge.set_filter ( Filter::None() );
+    } else if ( filter_mode == "binomial" ) {
+        sim.current.set_filter( Filter::Binomial( filter_order ) );
+        sim.charge.set_filter ( Filter::Binomial( filter_order ) );
     }
 
     // When a ppc is given, fall back to uniform density. 
@@ -459,15 +479,15 @@ void test_sparse( std::string param ) {
     Species electrons("electrons", -1.0f, ppc, true);
     if ( uniform )
         electrons.set_density(
-            Density::Uniform(1.0)
+            Density::Uniform(density)
         );
     else if ( spacing.x > 0 && spacing.y > 0 )
         electrons.set_density(
-            Density::Lattice(1.0, spacing)
+            Density::Lattice(density, spacing)
         );
     else
         electrons.set_density(
-            Density::Sparse(1.0, float2{ dx_part, dx_part })
+            Density::Sparse(density, float2{ dx_part, dx_part })
         );
     electrons.set_udist(
         UDistribution::ThermalCorr( uth, ufl )

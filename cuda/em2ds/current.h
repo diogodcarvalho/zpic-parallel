@@ -143,6 +143,16 @@ class Current {
     }
 
     /**
+     * @brief Sets the digital filter applied to the current after deposition
+     *
+     * @param new_filter    Filter to use (a clone is stored)
+     */
+    void set_filter( Filter::Digital const & new_filter ) {
+        delete filter;
+        filter = new_filter.clone();
+    }
+
+    /**
      * @brief Advances electric current density 1 time step
      * 
      * The routine will:

@@ -141,6 +141,16 @@ class Charge {
     }
 
     /**
+     * @brief Sets the digital filter applied to the charge density
+     *
+     * @param new_filter    Filter to use (a clone is stored)
+     */
+    void set_filter( Filter::Digital const & new_filter ) {
+        delete filter;
+        filter = new_filter.clone();
+    }
+
+    /**
      * @brief Advance charge
      *
      * @note This will i) update tile edge values, ii) add neutral background,
