@@ -396,12 +396,22 @@ public:
     /**
      * @brief Per-species contribution to the background plasma frequency squared
      *
-     * Returns (q/m_q) n0 = (q^2/m) n0, used as the implicit reference term
-     * omega_p0^2 in the Darwin transverse-field (shifted Helmholtz) solve.
+     * Returns n0 / |m_q| = n0 (q_phys^2 / m_phys), the physical plasma
+     * frequency squared, used as the implicit reference term omega_p0^2 in the
+     * Darwin transverse-field (shifted Helmholtz) solve.
+     *
+     * NOTE: this must use the *physical* charge-to-mass ratio (1/m_q), not the
+     * macroparticle charge `q`. The self-force response the shifted-Helmholtz
+     * term cancels is the deposit of q_p * dv/dt summed over particles, which
+     * equals (sum q_p)/m_q = n0/|m_q|, independent of how the density is split
+     * into macroparticles. This makes wp2 correct for the < 1ppc (Sparse /
+     * Lattice) case too, where the macroparticle charge `q` is not n0/ppc.
+     * Using `q` here scaled wp2 by the macroparticle charge, making the
+     * implicit term ~q too small (dense case) and diverging the iteration.
      *
      * @return double
      */
-    double darwin_wp2() const { return density->n0 * ( double(q) / m_q ); }
+    double darwin_wp2() const { return density->n0 / std::fabs( double(m_q) ); }
 
     /**
      * @brief Returns total time centered kinetic energy

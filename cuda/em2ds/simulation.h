@@ -143,8 +143,9 @@ class Simulation {
                 emf.darwin_solver_B( *current.fJ );
 
                 // Reference background plasma frequency squared (implicit term in
-                // the transverse-field shifted Helmholtz solve)
-                // TODO: This might need to be modified for the < 1ppc case
+                // the transverse-field shifted Helmholtz solve). darwin_wp2()
+                // uses the physical 1/m_q (not the macroparticle charge), so it
+                // is correct for the < 1ppc (Sparse / Lattice) case as well.
                 double wp2 = 0;
                 for ( auto & sp : species ) wp2 += sp -> darwin_wp2();
 
