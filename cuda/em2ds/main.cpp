@@ -361,6 +361,8 @@ void test_sparse( std::string param ) {
     float  tmax    = 0.002f;             // total simulation time
     float3 uth    { 0.0f, 0.0f, 0.0f };  // thermal velocity
     float3 ufl    { 0.0f, 0.0f, 0.0f };  // fluid velocity
+    std::string udist = "thermal";       // momentum distribution: thermal | maxwell_juttner
+    float theta   = 0.0f;                // normalized temperature kT/mc^2 (maxwell_juttner only)
     std::string filter_mode = "lowpass"; // source filter: none | lowpass | binomial
     unsigned filter_order = 1;           // binomial filter order (binomial only)
     unsigned seed  = 0;                  // RNG seed offset (vary for independent replicas)
@@ -388,6 +390,8 @@ void test_sparse( std::string param ) {
         else if ( key == "dt"         ) { got = std::sscanf( val.c_str(), "%f",       &dt );                    want = 1; }
         else if ( key == "uth"        ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &uth.x, &uth.y, &uth.z ); want = 3; }
         else if ( key == "ufl"        ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &ufl.x, &ufl.y, &ufl.z ); want = 3; }
+        else if ( key == "udist"      ) { udist = val; got = 1;                                                want = 1; }
+        else if ( key == "theta"      ) { got = std::sscanf( val.c_str(), "%f",       &theta );                want = 1; }
         else if ( key == "n_dump"     ) { got = std::sscanf( val.c_str(), "%u",       &n_dump );                want = 1; }
         else if ( key == "n_skip"     ) { got = std::sscanf( val.c_str(), "%u",       &n_skip );                want = 1; }
         else if ( key == "tmax"       ) { got = std::sscanf( val.c_str(), "%f",       &tmax );                  want = 1; }
@@ -436,6 +440,7 @@ void test_sparse( std::string param ) {
     std::cout << "n_dump    : " << n_dump  << '\n';
     std::cout << "n_skip    : " << n_skip  << " (first dump at t = " << n_skip * dt << ")\n";
     std::cout << "tmax      : " << tmax    << '\n';
+    std::cout << "udist     : " << udist   << ( udist == "maxwell_juttner" ? " (theta=" + std::to_string(theta) + ")" : "" ) << '\n';
     std::cout << "uth       : " << uth     << '\n';
     std::cout << "ufl       : " << ufl     << '\n';
     std::cout << "filter    : " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) + ")" : "" ) << '\n';
@@ -450,6 +455,11 @@ void test_sparse( std::string param ) {
     else if ( init == "none"    ) init_type = emf::init_type::none;
     else {
         std::cerr << "Unknown init type: '" << init << "' (expected poisson, darwin or none)\n";
+        std::exit(1);
+    }
+
+    if ( udist != "thermal" && udist != "maxwell_juttner" ) {
+        std::cerr << "Unknown udist: '" << udist << "' (expected thermal or maxwell_juttner)\n";
         std::exit(1);
     }
 
@@ -489,9 +499,14 @@ void test_sparse( std::string param ) {
         electrons.set_density(
             Density::Sparse(density, float2{ dx_part, dx_part })
         );
-    electrons.set_udist(
-        UDistribution::ThermalCorr( uth, ufl )
-    );
+    if ( udist == "maxwell_juttner" )
+        electrons.set_udist(
+            UDistribution::MaxwellJuttner( theta )
+        );
+    else
+        electrons.set_udist(
+            UDistribution::ThermalCorr( uth, ufl )
+        );
     electrons.seed = seed;
 
     sim.add_species( electrons );
