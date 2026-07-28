@@ -363,10 +363,12 @@ void test_sparse( std::string param ) {
     float3 ufl    { 0.0f, 0.0f, 0.0f };  // fluid velocity
     std::string udist = "thermal";       // momentum distribution: thermal | maxwell_juttner
     float theta   = 0.0f;                // normalized temperature kT/mc^2 (maxwell_juttner only)
-    std::string filter_mode = "lowpass"; // source filter: none | lowpass | binomial
+    std::string filter_mode = "lowpass"; // source filter: none | lowpass | binomial | gaussian
     unsigned filter_order = 1;           // binomial filter order (binomial only)
+    float filter_sigma = 0.707107f;      // gaussian width in cells (gaussian only; sqrt(1/2) = binomial order 1)
     unsigned seed  = 0;                  // RNG seed offset (vary for independent replicas)
     uint  save_part = 1;                 // dump particle phase space at each diag (0 = energy only, e.g. warm-up probe)
+    float dump_start = 0.0f;             // write field/particle dumps only from t >= this (in 1/w_p); energy is logged from t=0
     std::string init = "poisson";        // field initialization: poisson | darwin | none
     uint  darwin_iter = 2;               // number of Darwin bootstrap passes (init=darwin only)
 
@@ -406,8 +408,10 @@ void test_sparse( std::string param ) {
                                           else                                        filter_mode = val;
                                           got = 1; want = 1; }
         else if ( key == "filter_order") { got = std::sscanf( val.c_str(), "%u",       &filter_order );           want = 1; }
+        else if ( key == "filter_sigma") { got = std::sscanf( val.c_str(), "%f",       &filter_sigma );           want = 1; }
         else if ( key == "seed"       ) { got = std::sscanf( val.c_str(), "%u",       &seed );                    want = 1; }
         else if ( key == "save_part"  ) { got = std::sscanf( val.c_str(), "%u",       &save_part );               want = 1; }
+        else if ( key == "dump_start" ) { got = std::sscanf( val.c_str(), "%f",       &dump_start );              want = 1; }
         else if ( key == "init"       ) { init = val; got = 1;                                                    want = 1; }
         else if ( key == "darwin_iter") { got = std::sscanf( val.c_str(), "%u",       &darwin_iter );             want = 1; }
         else {
@@ -422,6 +426,8 @@ void test_sparse( std::string param ) {
 
     // Binomial filter order must be at least 1 (matches Filter::Binomial clamp)
     if ( filter_order < 1 ) filter_order = 1;
+    // Gaussian filter width must be positive (matches Filter::Gaussian clamp)
+    if ( filter_sigma <= 0 ) filter_sigma = 0.707107f;
 
     float2 box = dx * make_float2( ntiles.x * nx.x, ntiles.y * nx.y );
 
@@ -440,45 +446,52 @@ void test_sparse( std::string param ) {
     std::cout << "n_dump    : " << n_dump  << '\n';
     std::cout << "n_skip    : " << n_skip  << " (first dump at t = " << n_skip * dt << ")\n";
     std::cout << "tmax      : " << tmax    << '\n';
-    std::cout << "udist     : " << udist   << ( udist == "maxwell_juttner" ? " (theta=" + std::to_string(theta) + ")" : "" ) << '\n';
+    std::cout << "udist     : " << udist   << ( udist.rfind( "maxwell_juttner", 0 ) == 0 ? " (theta=" + std::to_string(theta) + ")" : "" ) << '\n';
     std::cout << "uth       : " << uth     << '\n';
     std::cout << "ufl       : " << ufl     << '\n';
-    std::cout << "filter    : " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) + ")" : "" ) << '\n';
+    std::cout << "filter    : " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) + ")" :
+                                                    filter_mode == "gaussian" ? " (sigma=" + std::to_string(filter_sigma) + " cells)" : "" ) << '\n';
     std::cout << "seed      : " << seed    << '\n';
     std::cout << "save_part : " << save_part << '\n';
+    std::cout << "dump_start: " << dump_start << " (field/particle dumps from t >= this)\n";
     std::cout << "init      : " << init    << ( init == "darwin" ? " (iter=" + std::to_string(darwin_iter) + ")" : "" ) << '\n';
 
     // Map the init string to the field initialization type
     emf::init_type::type init_type;
     if      ( init == "poisson" ) init_type = emf::init_type::poisson;
     else if ( init == "darwin"  ) init_type = emf::init_type::darwin;
+    else if ( init == "boosted" ) init_type = emf::init_type::boosted;
     else if ( init == "none"    ) init_type = emf::init_type::none;
     else {
-        std::cerr << "Unknown init type: '" << init << "' (expected poisson, darwin or none)\n";
+        std::cerr << "Unknown init type: '" << init << "' (expected poisson, darwin, boosted or none)\n";
         std::exit(1);
     }
 
-    if ( udist != "thermal" && udist != "maxwell_juttner" ) {
-        std::cerr << "Unknown udist: '" << udist << "' (expected thermal or maxwell_juttner)\n";
+    if ( udist != "thermal" && udist != "maxwell_juttner" && udist != "maxwell_juttner_corr" ) {
+        std::cerr << "Unknown udist: '" << udist
+                  << "' (expected thermal, maxwell_juttner or maxwell_juttner_corr)\n";
         std::exit(1);
     }
 
-    if ( filter_mode != "none" && filter_mode != "lowpass" && filter_mode != "binomial" ) {
-        std::cerr << "Unknown filter: '" << filter_mode << "' (expected none, lowpass or binomial)\n";
+    if ( filter_mode != "none" && filter_mode != "lowpass" && filter_mode != "binomial" && filter_mode != "gaussian" ) {
+        std::cerr << "Unknown filter: '" << filter_mode << "' (expected none, lowpass, binomial or gaussian)\n";
         std::exit(1);
     }
 
     Simulation sim( ntiles, nx, box, dt );
 
     // Override the default brick-wall Lowpass on current/charge with the requested
-    // source filter (none to measure collisionality, or binomial to avoid the Gibbs
-    // ringing the hard spectral cut introduces in the fields).
+    // source filter (none to measure collisionality, or binomial / gaussian to avoid
+    // the Gibbs ringing the hard spectral cut introduces in the fields).
     if ( filter_mode == "none" ) {
         sim.current.set_filter( Filter::None() );
         sim.charge.set_filter ( Filter::None() );
     } else if ( filter_mode == "binomial" ) {
         sim.current.set_filter( Filter::Binomial( filter_order ) );
         sim.charge.set_filter ( Filter::Binomial( filter_order ) );
+    } else if ( filter_mode == "gaussian" ) {
+        sim.current.set_filter( Filter::Gaussian( filter_sigma ) );
+        sim.charge.set_filter ( Filter::Gaussian( filter_sigma ) );
     }
 
     // When a ppc is given, fall back to uniform density. 
@@ -503,6 +516,17 @@ void test_sparse( std::string param ) {
         electrons.set_udist(
             UDistribution::MaxwellJuttner( theta )
         );
+    else if ( udist == "maxwell_juttner_corr" ) {
+        // Antithetic pairs are built inside each cell, so the profile must place a
+        // fixed (and even) number of particles per cell.
+        if ( ! uniform ) {
+            std::cerr << "udist=maxwell_juttner_corr requires a uniform density (set ppc)\n";
+            std::exit(1);
+        }
+        electrons.set_udist(
+            UDistribution::MaxwellJuttnerCorr( theta, ppc )
+        );
+    }
     else
         electrons.set_udist(
             UDistribution::ThermalCorr( uth, ufl )
@@ -516,23 +540,27 @@ void test_sparse( std::string param ) {
 
     // Lambda function for diagnostic output
     auto diag = [ & ]( ) {
-        sim.emf.save(emf::e, fcomp::x);
-        sim.emf.save(emf::e, fcomp::y);
-        sim.emf.save(emf::e, fcomp::z);
+        // Heavy field / particle dumps only from t >= dump_start; the energy
+        // report is always written so the budget is tracked from t = 0.
+        if ( sim.get_t() >= dump_start ) {
+            sim.emf.save(emf::e, fcomp::x);
+            sim.emf.save(emf::e, fcomp::y);
+            sim.emf.save(emf::e, fcomp::z);
 
-        sim.emf.save(emf::b, fcomp::x);
-        sim.emf.save(emf::b, fcomp::y);
-        sim.emf.save(emf::b, fcomp::z);
+            sim.emf.save(emf::b, fcomp::x);
+            sim.emf.save(emf::b, fcomp::y);
+            sim.emf.save(emf::b, fcomp::z);
 
-        sim.current.save(fcomp::x);
-        sim.current.save(fcomp::y);
-        sim.current.save(fcomp::z);
+            sim.current.save(fcomp::x);
+            sim.current.save(fcomp::y);
+            sim.current.save(fcomp::z);
 
-        sim.charge.save();
-        electrons.save_charge();
+            sim.charge.save();
+            electrons.save_charge();
 
-        if ( save_part )
-            electrons.save();
+            if ( save_part )
+                electrons.save();
+        }
         sim.energy_info();
     };
 
@@ -604,6 +632,151 @@ void cli_help( char * argv0 ) {
     std::cerr << '\n';
 }
 
+/**
+ * @brief Two-particle test for the field initializations (boosted / poisson / darwin)
+ *
+ * Places exactly two macroparticles (two single-Point species) at chosen positions
+ * with independent velocities and charge signs, then advances the system. Lets you
+ * study how the chosen field init behaves for a co-moving pair (near-force-free in
+ * the relativistic limit) or an interacting pair (where the uniform-motion boosted
+ * field is only approximate). Selected with `-t pair`.
+ *
+ * Params (key=value): ntiles, nx, dx, dt, tmax, n_dump, n_skip, save_part,
+ *   p1="x,y", p2="x,y" (positions, sim units),
+ *   u1="ux,uy,uz", u2="ux,uy,uz" (proper momentum u=gamma*beta),
+ *   s1, s2 (charge signs, +1/-1), q (charge magnitude),
+ *   init (poisson|darwin|boosted|none), filter (none|lowpass|binomial|gaussian),
+ *   filter_order (binomial), filter_sigma (gaussian).
+ */
+void test_boosted_pair( std::string param ) {
+
+    std::cout << ansi::bold << "Running " << __func__ << "()..." << ansi::reset << std::endl;
+
+    // Grid / time (defaults match the single-particle boosted test: 128 x 128 box)
+    uint2  ntiles { 2, 2 };
+    uint2  nx     { 64, 64 };
+    float  dx     = 1.0f;
+    float  dt     = 0.1f;
+    float  tmax   = 300.0f;
+    uint   n_dump = 100;
+    uint   n_skip = 0;
+    uint   save_part = 1;
+
+    // Two particles: positions (sim units), velocities (u = gamma*beta), charge signs
+    float2 p1 { 64.0f, 56.0f };
+    float2 p2 { 64.0f, 72.0f };
+    float3 u1 { 0.0f, 0.0f, 0.0f };
+    float3 u2 { 0.0f, 0.0f, 0.0f };
+    float  s1 = -1.0f, s2 = -1.0f;   // charge signs (mass/charge sign)
+    float  q  = 1.0f;                // charge magnitude (macroparticle charge)
+
+    std::string init = "boosted";
+    std::string filter_mode = "binomial";
+    unsigned filter_order = 1;
+    float filter_sigma = 0.707107f;
+    uint darwin_iter = 2;
+
+    std::istringstream tokens( param );
+    std::string tok;
+    while ( tokens >> tok ) {
+        auto eq = tok.find('=');
+        if ( eq == std::string::npos ) { std::cerr << "Invalid parameter: '" << tok << "'\n"; std::exit(1); }
+        std::string key = tok.substr(0,eq), val = tok.substr(eq+1);
+        int got, want;
+        if      ( key == "ntiles"      ) { got = std::sscanf(val.c_str(),"%u,%u",&ntiles.x,&ntiles.y);   want=2; }
+        else if ( key == "nx"          ) { got = std::sscanf(val.c_str(),"%u,%u",&nx.x,&nx.y);           want=2; }
+        else if ( key == "dx"          ) { got = std::sscanf(val.c_str(),"%f",&dx);                      want=1; }
+        else if ( key == "dt"          ) { got = std::sscanf(val.c_str(),"%f",&dt);                      want=1; }
+        else if ( key == "tmax"        ) { got = std::sscanf(val.c_str(),"%f",&tmax);                    want=1; }
+        else if ( key == "n_dump"      ) { got = std::sscanf(val.c_str(),"%u",&n_dump);                  want=1; }
+        else if ( key == "n_skip"      ) { got = std::sscanf(val.c_str(),"%u",&n_skip);                  want=1; }
+        else if ( key == "save_part"   ) { got = std::sscanf(val.c_str(),"%u",&save_part);               want=1; }
+        else if ( key == "p1"          ) { got = std::sscanf(val.c_str(),"%f,%f",&p1.x,&p1.y);           want=2; }
+        else if ( key == "p2"          ) { got = std::sscanf(val.c_str(),"%f,%f",&p2.x,&p2.y);           want=2; }
+        else if ( key == "u1"          ) { got = std::sscanf(val.c_str(),"%f,%f,%f",&u1.x,&u1.y,&u1.z);  want=3; }
+        else if ( key == "u2"          ) { got = std::sscanf(val.c_str(),"%f,%f,%f",&u2.x,&u2.y,&u2.z);  want=3; }
+        else if ( key == "s1"          ) { got = std::sscanf(val.c_str(),"%f",&s1);                      want=1; }
+        else if ( key == "s2"          ) { got = std::sscanf(val.c_str(),"%f",&s2);                      want=1; }
+        else if ( key == "q"           ) { got = std::sscanf(val.c_str(),"%f",&q);                       want=1; }
+        else if ( key == "init"        ) { init = val; got=1;                                            want=1; }
+        else if ( key == "filter"      ) { if      (val=="0"||val=="off") filter_mode="none";
+                                           else if (val=="1"||val=="on" ) filter_mode="lowpass";
+                                           else                            filter_mode=val;   got=1; want=1; }
+        else if ( key == "filter_order") { got = std::sscanf(val.c_str(),"%u",&filter_order);            want=1; }
+        else if ( key == "filter_sigma") { got = std::sscanf(val.c_str(),"%f",&filter_sigma);            want=1; }
+        else if ( key == "darwin_iter" ) { got = std::sscanf(val.c_str(),"%u",&darwin_iter);             want=1; }
+        else { std::cerr << "Unknown parameter key: '" << key << "'\n"; std::exit(1); }
+        if ( got != want ) { std::cerr << "Invalid value for '" << key << "': '" << val << "'\n"; std::exit(1); }
+    }
+    if ( filter_order < 1 ) filter_order = 1;
+    if ( filter_sigma <= 0 ) filter_sigma = 0.707107f;
+
+    float2 box = dx * make_float2( ntiles.x * nx.x, ntiles.y * nx.y );
+
+    emf::init_type::type init_type;
+    if      ( init == "poisson" ) init_type = emf::init_type::poisson;
+    else if ( init == "darwin"  ) init_type = emf::init_type::darwin;
+    else if ( init == "boosted" ) init_type = emf::init_type::boosted;
+    else if ( init == "none"    ) init_type = emf::init_type::none;
+    else { std::cerr << "Unknown init type: '" << init << "'\n"; std::exit(1); }
+
+    std::cout << "box   : " << box << '\n';
+    std::cout << "p1    : " << p1 << "  u1 : " << u1 << "  s1 : " << s1 << '\n';
+    std::cout << "p2    : " << p2 << "  u2 : " << u2 << "  s2 : " << s2 << '\n';
+    std::cout << "q     : " << q  << '\n';
+    std::cout << "init  : " << init << ( init == "darwin" ? " (iter=" + std::to_string(darwin_iter) + ")" : "" ) << '\n';
+    std::cout << "filter: " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) + ")" :
+                                                filter_mode == "gaussian" ? " (sigma=" + std::to_string(filter_sigma) + " cells)" : "" ) << '\n';
+
+    Simulation sim( ntiles, nx, box, dt );
+
+    if ( filter_mode == "none" ) {
+        sim.current.set_filter( Filter::None() );
+        sim.charge.set_filter ( Filter::None() );
+    } else if ( filter_mode == "binomial" ) {
+        sim.current.set_filter( Filter::Binomial( filter_order ) );
+        sim.charge.set_filter ( Filter::Binomial( filter_order ) );
+    } else if ( filter_mode == "gaussian" ) {
+        sim.current.set_filter( Filter::Gaussian( filter_sigma ) );
+        sim.charge.set_filter ( Filter::Gaussian( filter_sigma ) );
+    }
+
+    // Two single-particle species: independent position, velocity, charge sign.
+    // m_q sign sets the charge sign (q = copysign(norm_charge, m_q)); |m_q| = 1.
+    Species sp1( "part1", s1, uint2{1,1}, true );
+    sp1.set_density( Density::Point( q, p1 ) );
+    sp1.set_udist ( UDistribution::Cold( u1 ) );
+
+    Species sp2( "part2", s2, uint2{1,1}, true );
+    sp2.set_density( Density::Point( q, p2 ) );
+    sp2.set_udist ( UDistribution::Cold( u2 ) );
+
+    sim.add_species( sp1 );
+    sim.add_species( sp2 );
+
+    sim.init_fields( init_type, darwin_iter );
+
+    auto diag = [&]() {
+        sim.emf.save(emf::e, fcomp::x); sim.emf.save(emf::e, fcomp::y); sim.emf.save(emf::e, fcomp::z);
+        sim.emf.save(emf::b, fcomp::x); sim.emf.save(emf::b, fcomp::y); sim.emf.save(emf::b, fcomp::z);
+        sim.charge.save();
+        if ( save_part ) { sp1.save(); sp2.save(); }
+        sim.energy_info();
+    };
+
+    Timer timer; timer.start();
+    if ( n_skip == 0 ) diag();
+    while ( sim.get_t() <= tmax ) {
+        sim.advance();
+        if ( sim.get_iter() % 100 == 0 )
+            std::cout << "iter = " << sim.get_iter() << ", t = " << sim.get_t() << '\n';
+        unsigned const it = sim.get_iter();
+        if ( it >= n_skip && ( it - n_skip ) % n_dump == 0 ) diag();
+    }
+    timer.stop();
+    std::cout << ansi::bold << "Done!\n" << ansi::reset;
+}
+
 int main( int argc, char *argv[] ) {
 
     // Line-buffer stdout so progress prints appear immediately when output is
@@ -647,5 +820,8 @@ int main( int argc, char *argv[] ) {
     // test_laser();
     // test_mov();
     // test_weibel();
-    test_sparse( param );
+    if ( test == "pair" )
+        test_boosted_pair( param );
+    else
+        test_sparse( param );
 }
