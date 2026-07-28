@@ -23,7 +23,7 @@ namespace emf {
     typedef bnd<bc::type> bc_type;
 
     namespace init_type {
-        enum type { none = 0, poisson, darwin };
+        enum type { none = 0, poisson, darwin, boosted };
     }
 }
 
@@ -198,6 +198,19 @@ class EMF {
         basic_grid3<std::complex<float>> & fM2,
         Charge & charge,
         float const wp2 );
+
+    /**
+     * @brief Finalize the "boosted Coulomb" field initialization
+     *
+     * Consumes the per-particle summed fields already accumulated in fE (full E)
+     * and fB (B) by Species::deposit_boosted_fields, applies the quartic particle
+     * shape factor S(k), stores the transverse part of S*fE into fEt and S*fB back
+     * into fB, then rebuilds the longitudinal E from the deposited charge (via
+     * poisson_solver) and transforms both fields to real space.
+     *
+     * @param charge    Charge object with frho already populated (longitudinal E)
+     */
+    void boosted_solver( Charge & charge );
 
 
     void advance( );

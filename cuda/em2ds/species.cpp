@@ -1395,6 +1395,123 @@ void Species::deposit_darwin_retarded_current( vec3grid<float3> * const J ) cons
 namespace kernel {
 __global__
 /**
+ * @brief Accumulate the boosted-Coulomb field of every particle in k-space
+ *
+ * One block per k-space line (iy); each thread owns a set of k-columns (ix) and
+ * loops over ALL particles (all tiles), summing the exact frozen field of each as
+ * a uniformly moving point charge. See Species::deposit_boosted_fields for the
+ * formulas. The k=0 mode is skipped (left unchanged).
+ *
+ * @param part  Particle data (tiled)
+ * @param q     Macroparticle charge
+ * @param dx    Real-space cell size (to reconstruct global particle position)
+ * @param d_fE  [in,out] full E-field accumulator (k-space)
+ * @param d_fB  [in,out] B-field accumulator (k-space)
+ * @param dims  Global (half-)spectrum dimensions
+ * @param dk    k-space cell size
+ */
+void deposit_boosted_fields(
+    ParticleData const part, float const q, float2 const dx,
+    fft::complex64 * const __restrict__ d_fE,
+    fft::complex64 * const __restrict__ d_fB,
+    uint2 const dims, float2 const dk )
+{
+    fft::complex64 * const __restrict__ fEx = & d_fE[                   0 ];
+    fft::complex64 * const __restrict__ fEy = & d_fE[     dims.x * dims.y ];
+    fft::complex64 * const __restrict__ fEz = & d_fE[ 2 * dims.x * dims.y ];
+
+    fft::complex64 * const __restrict__ fBx = & d_fB[                   0 ];
+    fft::complex64 * const __restrict__ fBy = & d_fB[     dims.x * dims.y ];
+    fft::complex64 * const __restrict__ fBz = & d_fB[ 2 * dims.x * dims.y ];
+
+    const int iy   = blockIdx.x;
+    const float ky = ((iy < int(dims.y/2)) ? iy : (iy - int(dims.y)) ) * dk.y;
+
+    const int ntiles = part.ntiles.x * part.ntiles.y;
+    const int stride = dims.x;
+
+    for( auto ix = block_thread_rank(); ix < dims.x; ix += block_num_threads() ) {
+        auto idx = iy * stride + ix;
+
+        const float kx = ix * dk.x;
+        const float k2 = kx*kx + ky*ky;
+        if ( k2 == 0.f ) continue;    // k=0 mode left unchanged
+
+        fft::complex64 Ex(0), Ey(0), Ez(0), Bx(0), By(0), Bz(0);
+
+        // Loop over every particle in every tile
+        for( int tid = 0; tid < ntiles; tid++ ) {
+            const int    tx       = tid % part.ntiles.x;
+            const int    ty       = tid / part.ntiles.x;
+            const int    tile_off = part.offset[ tid ];
+            const int    tile_np  = part.np[ tid ];
+            int2   const * const __restrict__ pix = & part.ix[ tile_off ];
+            float2 const * const __restrict__ pxf = & part.x[ tile_off ];
+            float3 const * const __restrict__ pu  = & part.u[ tile_off ];
+
+            for( int p = 0; p < tile_np; p++ ) {
+                // Global physical position
+                const float X = ( tx * part.nx.x + pix[p].x + 0.5f + pxf[p].x ) * dx.x;
+                const float Y = ( ty * part.nx.y + pix[p].y + 0.5f + pxf[p].y ) * dx.y;
+
+                // Velocity beta = u * rgamma(u)
+                const float3 u  = pu[p];
+                const float rg = rgamma( u );
+                const float bx = u.x * rg;
+                const float by = u.y * rg;
+                const float bz = u.z * rg;
+
+                const float bk = bx * kx + by * ky;   // beta . k   ( k_z = 0 )
+                const float D = k2 - bk * bk;         // > 0 for beta < 1
+
+                // phi = q e^{-i k.x} / D
+                const float ph = -( kx * X + ky * Y );
+                float s, c;
+                sincosf( ph, &s, &c );
+                const float invD = q / D;
+                const fft::complex64 phi( c * invD, s * invD );
+
+                // E = -i [ k - (beta.k) beta ] phi     ( -i*phi = ( phi.y, -phi.x ) )
+                const fft::complex64 miphi( phi.y, -phi.x );
+                Ex += miphi * ( kx - bk * bx );
+                Ey += miphi * ( ky - bk * by );
+                Ez += miphi * (    - bk * bz );
+
+                // B = i ( k x beta ) phi               (  i*phi = ( -phi.y, phi.x ) )
+                const fft::complex64 iphi( -phi.y, phi.x );
+                Bx += iphi * (  ky * bz );
+                By += iphi * ( -kx * bz );
+                Bz += iphi * (  kx * by - ky * bx );
+            }
+        }
+
+        fEx[idx] += Ex;
+        fEy[idx] += Ey;
+        fEz[idx] += Ez;
+        fBx[idx] += Bx;
+        fBy[idx] += By;
+        fBz[idx] += Bz;
+    }
+}
+}
+
+void Species::deposit_boosted_fields(
+    basic_grid3<std::complex<float>> & fE,
+    basic_grid3<std::complex<float>> & fB ) const
+{
+    // One k-line per block
+    // Each thread loops over all particles (exact, and thus O(n_particles x n_grid))
+    kernel::deposit_boosted_fields <<< fE.dims.y, 256 >>> (
+        *particles, q, dx,
+        reinterpret_cast<fft::complex64 *>( fE.d_buffer ),
+        reinterpret_cast<fft::complex64 *>( fB.d_buffer ),
+        fE.dims, fft::dk( box )
+    );
+}
+
+namespace kernel {
+__global__
+/**
  * @brief Kernel for charge density deposition
  * 
  * @param part              Particle data

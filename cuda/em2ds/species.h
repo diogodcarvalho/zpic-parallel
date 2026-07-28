@@ -394,6 +394,32 @@ public:
     void deposit_darwin_retarded_current( vec3grid<float3> * const J ) const;
 
     /**
+     * @brief Accumulate this species' contribution to the boosted-Coulomb field init
+     *
+     * Adds, in k-space, the exact frozen field of every macroparticle treated as a
+     * uniformly moving point charge (rest-frame Coulomb field boosted to the lab):
+     *
+     *   phi_i = q e^{-i k.x_i} / ( k^2 - (beta_i.k)^2 )
+     *   E_i   = -i [ k - (beta_i.k) beta_i ] phi_i
+     *   B_i   =  i ( k x beta_i ) phi_i
+     *
+     * summed over all particles into fE (full E) and fB (B). The k=0 mode is left
+     * untouched. The quartic shape factor and digital filter are applied afterwards
+     * (EMF::boosted_solver / the init driver).
+     *
+     * @warning O(N_particles x N_grid): one full k-grid pass per particle. Fine for
+     *          single particles / beams, but slow for large thermal plasmas. A future
+     *          faster path (velocity-group binning, or a low-beta moment expansion of
+     *          1/(k^2 - (beta.k)^2)) would avoid the per-particle loop.
+     *
+     * @param fE    [in,out] k-space full E-field accumulator
+     * @param fB    [in,out] k-space B-field accumulator
+     */
+    void deposit_boosted_fields(
+        basic_grid3<std::complex<float>> & fE,
+        basic_grid3<std::complex<float>> & fB ) const;
+
+    /**
      * @brief Per-species contribution to the background plasma frequency squared
      *
      * Returns n0 / |m_q| = n0 (q_phys^2 / m_phys), the physical plasma

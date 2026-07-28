@@ -425,6 +425,76 @@ void update_fEt_darwin(
     }
 }
 
+__global__
+/**
+ * @brief Finalize the boosted-Coulomb field init
+ *
+ * Reads the per-particle summed full-E (d_fE_sum) and B (d_fB), applies the
+ * quartic particle shape factor S(k) = [ sinc(kx dx/2) sinc(ky dy/2) ]^5 (a single
+ * factor, matching the one S(k) that the deposited charge frho already carries),
+ * writes the transverse projection of S*E_sum into d_fEt and S*B_sum into d_fB.
+ *
+ * @param d_fEt     [out] transverse E-field (k-space)
+ * @param d_fB      [in,out] magnetic field: reads B_sum, writes S*B_sum
+ * @param d_fE_sum  per-particle summed full E-field (k-space)
+ * @param dims      Global (half-)spectrum dimensions
+ * @param dk        k-space cell size
+ * @param dx        Real-space cell size (for the shape factor)
+ */
+void finalize_boosted(
+    fft::complex64 * const __restrict__ d_fEt,
+    fft::complex64 * const __restrict__ d_fB,
+    fft::complex64 const * const __restrict__ d_fE_sum,
+    uint2 const dims, float2 const dk, float2 const dx )
+{
+    fft::complex64 * const __restrict__ fEtx = & d_fEt[                   0 ];
+    fft::complex64 * const __restrict__ fEty = & d_fEt[     dims.x * dims.y ];
+    fft::complex64 * const __restrict__ fEtz = & d_fEt[ 2 * dims.x * dims.y ];
+
+    fft::complex64 * const __restrict__ fBx = & d_fB[                   0 ];
+    fft::complex64 * const __restrict__ fBy = & d_fB[     dims.x * dims.y ];
+    fft::complex64 * const __restrict__ fBz = & d_fB[ 2 * dims.x * dims.y ];
+
+    fft::complex64 const * const __restrict__ fEx = & d_fE_sum[                   0 ];
+    fft::complex64 const * const __restrict__ fEy = & d_fE_sum[     dims.x * dims.y ];
+    fft::complex64 const * const __restrict__ fEz = & d_fE_sum[ 2 * dims.x * dims.y ];
+
+    const int iy   = blockIdx.x;
+    const float ky = ((iy < int(dims.y/2)) ? iy : (iy - int(dims.y)) ) * dk.y;
+
+    const int stride = dims.x;
+    for( auto ix = block_thread_rank(); ix < dims.x; ix += block_num_threads() ) {
+        auto idx = iy * stride + ix;
+
+        const float kx = ix * dk.x;
+        const float k2 = kx*kx + ky*ky;
+
+        // Quartic (order-4 B-spline) shape factor S(k) = [sinc(kx dx/2) sinc(ky dy/2)]^5,
+        // applied once (matches the single S(k) that the deposited charge already carries)
+        const float ax = 0.5f * kx * dx.x;
+        const float ay = 0.5f * ky * dx.y;
+        const float sx = ( ax != 0.f ) ? sinf(ax) / ax : 1.f;
+        const float sy = ( ay != 0.f ) ? sinf(ay) / ay : 1.f;
+        const float sk = sx * sy;
+        const float S  = sk*sk*sk*sk*sk;
+
+        // Transverse projection of S * E_sum ( E_T = Ẽ - k (k.Ẽ)/k^2 )
+        const fft::complex64 Ex = fEx[idx] * S;
+        const fft::complex64 Ey = fEy[idx] * S;
+        const fft::complex64 Ez = fEz[idx] * S;
+
+        const fft::complex64 kdE = kx * Ex + ky * Ey;
+        fEtx[idx] = ( k2 > 0 ) ? Ex - kx * kdE / k2 : fft::complex64(0);
+        fEty[idx] = ( k2 > 0 ) ? Ey - ky * kdE / k2 : fft::complex64(0);
+        fEtz[idx] = Ez;
+
+        // Shaped magnetic field
+        fBx[idx] = fBx[idx] * S;
+        fBy[idx] = fBy[idx] * S;
+        fBz[idx] = fBz[idx] * S;
+    }
+}
+
 }
 
 /**
@@ -574,6 +644,35 @@ double EMF::darwin_solver(
     // Relative L2 change of the transverse field (falls back to absolute if
     // E_T is still identically zero, e.g. the first pass with no current)
     return ( acc[1] > 0 ) ? std::sqrt( acc[0] / acc[1] ) : std::sqrt( acc[0] );
+}
+
+/**
+ * @brief Finalize the "boosted Coulomb" field initialization
+ *
+ * On entry fE holds the per-particle summed full E-field and fB the summed B-field
+ * (as accumulated by Species::deposit_boosted_fields). This applies the quartic
+ * shape factor, extracts the transverse E into fEt and stores the shaped B into fB,
+ * then rebuilds the longitudinal E from the deposited charge and transforms both
+ * fields to real space.
+ *
+ * @param charge    Charge object with frho already populated (longitudinal E)
+ */
+void EMF::boosted_solver( Charge & charge ) {
+
+    // Shape + transverse projection: fEt <- transverse(S * fE) ; fB <- S * fB
+    kernel::finalize_boosted <<< fEt -> dims.y, 256 >>> (
+        reinterpret_cast<fft::complex64 *>( fEt -> d_buffer ),
+        reinterpret_cast<fft::complex64 *>( fB  -> d_buffer ),
+        reinterpret_cast<fft::complex64 *>( fE  -> d_buffer ),
+        fEt -> dims, fft::dk( box ), dx
+    );
+
+    // Reconstruct total E = E_L(rho) + E_T and transform to real space
+    poisson_solver( charge );
+
+    // Transform B to real space
+    fft_backward -> transform( *fB, *B );
+    B -> copy_to_gc();
 }
 
 /**

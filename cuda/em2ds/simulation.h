@@ -203,6 +203,35 @@ class Simulation {
                 break;
             }
 
+            case emf::init_type::boosted:
+            {
+                // Longitudinal source: deposit charge exactly as the poisson case.
+                // The transverse E is rebuilt on top of this frho by boosted_solver.
+                for ( auto & sp : species ) sp -> deposit_charge( *charge.rho );
+                charge.rho -> add_from_gc();
+                charge.fft_forward -> transform( *charge.rho, *charge.frho );
+                charge.filter -> apply( *charge.frho );
+
+                // Accumulate the exact per-particle boosted-Coulomb fields (full E
+                // and B) in k-space. Reuses emf.fE as the E_sum accumulator (it is
+                // overwritten by the poisson reconstruction inside boosted_solver).
+                emf.fE -> zero();
+                emf.fB -> zero();
+                for ( auto & sp : species ) sp -> deposit_boosted_fields( *emf.fE, *emf.fB );
+
+                // Filter E_sum and B_sum with the same digital filter applied to the
+                // charge (the scalar filter commutes with the shape factor and the
+                // transverse projection that boosted_solver applies next).
+                charge.filter -> apply( *emf.fE );
+                charge.filter -> apply( *emf.fB );
+
+                // Shape factor + transverse projection -> fEt, shaped B -> fB,
+                // longitudinal E from frho, and transform both fields to real space.
+                emf.boosted_solver( charge );
+
+                break;
+            }
+
             case emf::init_type::none:
             default:
                 break;
