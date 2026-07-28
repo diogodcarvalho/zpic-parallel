@@ -1297,3 +1297,81 @@ void Density::Lattice::np_inject( Particles & particles,
 
     kernel::lattice_np <<< grid, block >>> ( range, spacing, particles, np );
 }
+
+namespace kernel {
+
+/**
+ * @brief Set the per-tile injection count for a single Point particle
+ *
+ * The whole per-tile count array must be written (0 everywhere, 1 in the owner
+ * tile) because Species::initialize exclusive-scans it to build the buffer offsets.
+ *
+ * @param np        [out] per-tile particle count array
+ * @param ntiles    Total number of tiles
+ * @param owner     Tile that contains the point
+ */
+__global__
+void point_np( int * np, int ntiles, int owner )
+{
+    for ( int i = 0; i < ntiles; i++ ) np[i] = 0;
+    np[ owner ] = 1;
+}
+
+/**
+ * @brief Write the single Point macroparticle into its owning tile
+ *
+ * @param owner     Tile that contains the point
+ * @param cell      Cell index within the owner tile
+ * @param xf        In-cell position ( x in [-0.5, 0.5) about the cell center )
+ * @param part      Particle data
+ */
+__global__
+void point_inject( int owner, int2 cell, float2 xf, ParticleData const part )
+{
+    const int off = part.offset[ owner ];
+    part.ix[ off ] = cell;
+    part.x [ off ] = xf;
+    part.u [ off ] = make_float3( 0, 0, 0 );
+    part.np[ owner ] = 1;
+}
+
+}
+
+// Resolve the point to its owning tile, in-tile cell index and in-cell offset.
+static inline void point_locate(
+    float2 const pos, float2 const dx, uint2 const ntiles, uint2 const nx,
+    int & owner, int2 & cell, float2 & xf )
+{
+    const float cellfx = pos.x / dx.x;
+    const float cellfy = pos.y / dx.y;
+    const int cx = int( std::floor( cellfx ) );
+    const int cy = int( std::floor( cellfy ) );
+    const int tx = cx / int( nx.x );
+    const int ty = cy / int( nx.y );
+    owner = ty * int( ntiles.x ) + tx;
+    cell  = make_int2( cx - tx * int( nx.x ), cy - ty * int( nx.y ) );
+    xf    = make_float2( cellfx - cx - 0.5f, cellfy - cy - 0.5f );
+}
+
+void Density::Point::inject( Particles & particles,
+    uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range ) const
+{
+    int owner;
+    int2 cell;
+    float2 xf;
+    point_locate( pos, dx, particles.ntiles, particles.nx, owner, cell, xf );
+
+    kernel::point_inject <<< 1, 1 >>> ( owner, cell, xf, particles );
+}
+
+void Density::Point::np_inject( Particles & particles,
+    uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range,
+    int * np ) const
+{
+    int owner;
+    int2 cell;
+    float2 xf;
+    point_locate( pos, dx, particles.ntiles, particles.nx, owner, cell, xf );
+
+    kernel::point_np <<< 1, 1 >>> ( np, particles.ntiles.x * particles.ntiles.y, owner );
+}

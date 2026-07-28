@@ -204,6 +204,32 @@ namespace Density {
         void np_inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range, int * np ) const override;
     };
 
+    /**
+     * @brief Single point macroparticle
+     *
+     * Injects exactly one macroparticle at a chosen position (simulation units).
+     * The macroparticle charge is n0.
+     */
+    class Point : public Profile {
+        public:
+
+        /// @brief Particle position (simulation units)
+        const float2 pos;
+
+        Point( float const n0, float2 pos ) : Profile(n0), pos(pos) {};
+
+        Point * clone() const override {
+            return new Point(n0, pos);
+        };
+
+        // The macroparticle carries the full charge n0 (a single particle, not a
+        // per-cell density split).
+        float norm_charge( uint2 const ppc ) const override { return n0; }
+
+        void inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range ) const override;
+        void np_inject( Particles & part, uint2 const ppc, float2 const dx, float2 const ref, bnd<unsigned int> range, int * np ) const override;
+    };
+
 }
 
 #endif
