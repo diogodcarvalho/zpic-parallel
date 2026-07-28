@@ -126,6 +126,65 @@ void kernel_binomial3( fft::complex64 * const __restrict__ fld,
     }
 }
 
+__global__
+void kernel_gaussian( fft::complex64 * const __restrict__ data,
+    uint2 const dims, float const sigma )
+{
+    const int iy  = blockIdx.x;  // Line
+    const int ky  = abs( ((iy < dims.y/2) ? iy : (iy - int(dims.y)) ) );
+
+    const int stride = dims.x;
+
+    // Gaussian transfer exp( -(sigma * k.dx)^2 / 2 ) on the (complex) y-axis, i.e. a
+    // real-space convolution with a Gaussian of rms width `sigma` cells. The Nyquist
+    // frequency ( k.dx = pi ) sits at ky = dims.y / 2.
+    const float a = -0.5f * sigma * sigma;
+
+    const float kdy = 2 * M_PI * ky / float( dims.y );
+    const float hy  = expf( a * kdy * kdy );
+
+    for( auto ix = block_thread_rank(); ix < dims.x; ix += block_num_threads() ) {
+        auto idx = iy * stride + ix;
+
+        // x is the real-FFT axis: Nyquist sits at ix = dims.x - 1
+        const float kdx = M_PI * ix / float( dims.x - 1 );
+        const float hx  = expf( a * kdx * kdx );
+
+        data[ idx ] *= hx * hy;
+    }
+}
+
+__global__
+void kernel_gaussian3( fft::complex64 * const __restrict__ fld,
+    uint2 const dims, float const sigma )
+{
+    const int iy  = blockIdx.x;  // Line
+    const int ky  = abs( ((iy < dims.y/2) ? iy : (iy - int(dims.y)) ) );
+
+    const int stride = dims.x;
+
+    fft::complex64 * const __restrict__ fldx = & fld [ 0 ];
+    fft::complex64 * const __restrict__ fldy = & fld [ dims.x * dims.y ];
+    fft::complex64 * const __restrict__ fldz = & fld [ 2 * dims.x * dims.y ];
+
+    const float a = -0.5f * sigma * sigma;
+
+    const float kdy = 2 * M_PI * ky / float( dims.y );
+    const float hy  = expf( a * kdy * kdy );
+
+    for( auto ix = block_thread_rank(); ix < dims.x; ix += block_num_threads() ) {
+        auto idx = iy * stride + ix;
+
+        const float kdx = M_PI * ix / float( dims.x - 1 );
+        const float hx  = expf( a * kdx * kdx );
+
+        const float h = hx * hy;
+        fldx[ idx ] *= h;
+        fldy[ idx ] *= h;
+        fldz[ idx ] *= h;
+    }
+}
+
 }
 
 namespace Filter {
@@ -168,11 +227,10 @@ class Lowpass : public Digital {
     }
 };
 
-// Binomial low-pass filter. The k-space transfer [cos^2(k.dx/2)]^order is the exact
-// equivalent of applying an [1/4,1/2,1/4] real-space stencil `order` times (cf. the
-// real-space Filter::Binomial in cuda/em2d), but evaluated directly on the spectral
-// fields. Unlike the brick-wall Lowpass it rolls off smoothly, so it suppresses high-k
-// content without the Gibbs ringing a hard spectral cut introduces in the fields.
+// Binomial low-pass filter. 
+// The k-space transfer [cos^2(k.dx/2)]^order is the exact equivalent of applying an 
+// [1/4,1/2,1/4] real-space stencil `order` times (cf. the real-space Filter::Binomial in cuda/em2d)
+// but evaluated directly on the spectral fields.
 class Binomial : public Digital {
     protected:
 
@@ -193,6 +251,36 @@ class Binomial : public Digital {
         kernel_binomial3 <<< fld.dims.y, 256 >>> (
             reinterpret_cast<fft::complex64 *>( fld.d_buffer ),
             fld.dims, order );
+    }
+};
+
+// Gaussian low-pass filter. 
+// The k-space transfer exp( -(sigma k.dx)^2 / 2 ) is a real-space convolution with a
+// Gaussian of rms width `sigma` cells. The width is continuous rather than quantized by the
+// stencil order: sigma = sqrt( order / 2 ) matches [cos^2(k.dx/2)]^order to O(k^4), so the
+// default sigma = sqrt(1/2) is the Gaussian equivalent of Binomial( 1 ). Note that, unlike
+// the binomial, the transfer never reaches exactly 0 at the Nyquist frequency
+// ( exp( -sigma^2 pi^2 / 2 ) = 0.085 for the default sigma ).
+class Gaussian : public Digital {
+    protected:
+
+    float sigma;
+
+    public:
+
+    Gaussian( float sigma = M_SQRT1_2 ) : sigma( (sigma > 0) ? sigma : float(M_SQRT1_2) ) {};
+
+    Gaussian * clone() const override { return new Gaussian ( sigma ); };
+
+    void apply( basic_grid<std::complex<float>> & fld ) {
+        kernel_gaussian <<< fld.dims.y, 256 >>> (
+            reinterpret_cast<fft::complex64 *>( fld.d_buffer ),
+            fld.dims, sigma );
+    }
+    void apply( basic_grid3<std::complex<float>> & fld ) {
+        kernel_gaussian3 <<< fld.dims.y, 256 >>> (
+            reinterpret_cast<fft::complex64 *>( fld.d_buffer ),
+            fld.dims, sigma );
     }
 };
 
