@@ -203,6 +203,41 @@ void UDistribution::ThermalCorr::set( Particles & part, unsigned int seed ) cons
 
 namespace kernel {
 
+/**
+ * @brief Draws a single Maxwell-Jüttner proper momentum (rest frame)
+ *
+ * Sobol rejection sampling of the magnitude (Zenitani 2015, Phys. Plasmas 22,
+ * 042116) followed by an isotropic direction. 
+ * 
+ * @note Acceptance becomes inefficient (but stays correct) for theta << 1.
+ *
+ * @param state     PRNG state, will be modified by this call
+ * @param theta     Normalized temperature kT/(mc^2)
+ * @return Proper momentum u = gamma * beta
+ */
+__device__
+float3 maxwell_juttner_sample( uint2 & state, const float theta )
+{
+    // Sobol method
+    double mag, eta;
+    do {
+        double x1 = zrandom::rand_real3( state );
+        double x2 = zrandom::rand_real3( state );
+        double x3 = zrandom::rand_real3( state );
+        double x4 = zrandom::rand_real3( state );
+        // candidate magnitude, sampled from Gamma(3,theta)
+        mag = -theta * ( log(x1) + log(x2) + log(x3) );
+        eta = mag - theta * log(x4);
+    } while ( eta*eta - mag*mag <= 1.0 );
+
+    // Isotropic direction on the sphere
+    double cos_theta = 2.0 * zrandom::rand_real3( state ) - 1.0;
+    double sin_theta = sqrt( 1.0 - cos_theta*cos_theta );
+    double phi = 2.0 * M_PI * zrandom::rand_real3( state );
+
+    return make_float3( mag*sin_theta*cos(phi), mag*sin_theta*sin(phi), mag*cos_theta );
+}
+
 __global__
 void maxwell_juttner( ParticleData const part, uint2 rnd_seed, const float theta )
 {
@@ -222,26 +257,62 @@ void maxwell_juttner( ParticleData const part, uint2 rnd_seed, const float theta
     );
 
     for( auto i = block_thread_rank(); i < tile_np; i += block_num_threads() ) {
+        u[i] = maxwell_juttner_sample( state, theta );
+    }
+}
 
-        // Sobol method
-        // Acceptance becomes inefficient (but stays correct) for theta << 1.
-        double mag, eta;
-        do {
-            double x1 = zrandom::rand_real3( state );
-            double x2 = zrandom::rand_real3( state );
-            double x3 = zrandom::rand_real3( state );
-            double x4 = zrandom::rand_real3( state );
-            // candidate magnitude, sampled from Gamma(3,theta)
-            mag = -theta * ( log(x1) + log(x2) + log(x3) );
-            eta = mag - theta * log(x4);
-        } while ( eta*eta - mag*mag <= 1.0 );
+__global__
+void maxwell_juttner_corr( ParticleData const part, uint2 rnd_seed, const float theta,
+    int const np_cell )
+{
+    const uint2 tile_idx = { blockIdx.x, blockIdx.y };
+    const int   tile_id  = tile_idx.y * part.ntiles.x + tile_idx.x;
 
-        // Isotropic direction on the sphere
-        double cos_theta = 2.0 * zrandom::rand_real3( state ) - 1.0;
-        double sin_theta = sqrt( 1.0 - cos_theta*cos_theta );
-        double phi = 2.0 * M_PI * zrandom::rand_real3( state );
+    const auto  tile_off = part.offset[ tile_id ];
+    const auto  tile_np  = part.np[ tile_id ];
 
-        u[i] = make_float3( mag*sin_theta*cos(phi), mag*sin_theta*sin(phi), mag*cos_theta );
+    const auto ystride = part.nx.x;
+
+    float3 * __restrict__ const u  = &part.u [ tile_off ];
+    int2   * __restrict__ const ix = &part.ix[ tile_off ];
+
+    // Get shared memory address
+    extern __shared__ char block_shm[];
+
+    auto const bsize = part.nx.x * part.nx.y;
+    int * const __restrict__ npcell = reinterpret_cast<int*> ( & block_shm[0] );
+
+    for( auto idx = block_thread_rank(); idx < bsize; idx += block_num_threads() ) {
+        npcell[idx] = 0;
+    }
+
+    block_sync();
+
+    for( auto i = block_thread_rank(); i < tile_np; i += block_num_threads() ) {
+
+        int const idx = ix[i].x + ystride * ix[i].y;
+
+        // Rank of this particle inside its cell. Ranks (2p, 2p+1) form an
+        // antithetic pair: both draw the same momentum, the odd one takes -u.
+        // The distribution is isotropic so f(u) stays exactly Maxwell-Jüttner,
+        // while sum(u) over the cell becomes exactly 0.
+        int const rank = block::atomic_fetch_add( & npcell[idx], 1 );
+
+        // The two members of a pair sit at arbitrary indices (injection places
+        // consecutive particles in different cells), are handled by different
+        // threads, and never communicate: they agree on the momentum solely by
+        // seeding the same stream, keyed on (cell, pair). Hence the state is
+        // seeded per particle here, rather than once per thread as in
+        // kernel::maxwell_juttner above - the stream follows the pair, not the
+        // thread. Cost is one redundant Sobol draw per pair.
+        uint2 state;
+        zrandom::rand_init(
+            ( tile_id * bsize + idx ) * ( np_cell / 2 ) + ( rank >> 1 ),
+            rnd_seed, state
+        );
+
+        float const sign = ( rank & 1 ) ? -1.f : +1.f;
+        u[i] = maxwell_juttner_sample( state, theta ) * sign;
     }
 }
 
@@ -261,4 +332,23 @@ void UDistribution::MaxwellJuttner::set( Particles & part, unsigned int seed ) c
     dim3 block( 64 );
 
     kernel::maxwell_juttner <<< grid, block >>> ( part, rnd_seed, theta );
+}
+
+/**
+ * @brief Sets a Maxwell-Jüttner momentum distribution with zero net cell current
+ *
+ * Same sampling as MaxwellJuttner, but the ppc particles of each cell are loaded
+ * as antithetic pairs ( u, -u ), so every cell carries exactly zero net drift.
+ */
+void UDistribution::MaxwellJuttnerCorr::set( Particles & part, unsigned int seed ) const
+{
+    uint2 rnd_seed{ 12345 + seed, 67890 };
+    dim3 grid( part.ntiles.x, part.ntiles.y );
+    dim3 block( 64 );
+
+    const auto bsize = part.nx.x * part.nx.y;
+    const size_t shm_size = bsize * sizeof( int );
+    block::set_shmem_size( kernel::maxwell_juttner_corr, shm_size );
+    kernel::maxwell_juttner_corr <<< grid, block, shm_size >>> (
+        part, rnd_seed, theta, ppc.x * ppc.y );
 }

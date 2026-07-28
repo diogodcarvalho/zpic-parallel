@@ -72,6 +72,28 @@ namespace UDistribution {
         MaxwellJuttner * clone() const override { return new MaxwellJuttner(theta); };
         void set( Particles & part, unsigned int seed ) const override ;
     };
+
+    class MaxwellJuttnerCorr : public Type {
+
+        public:
+        const float theta;    // normalized temperature kT/(mc^2)
+        const uint2 ppc;      // particles per cell, must be even (antithetic pairs)
+        MaxwellJuttnerCorr( float const theta, uint2 const ppc ) : theta(theta), ppc(ppc) {
+            if ( theta <= 0 ) {
+                std::cout << "(*error*) MaxwellJuttnerCorr requires theta > 0\n";
+                exit(1);
+            }
+            if ( ( ppc.x * ppc.y ) % 2 ) {
+                std::cout << "(*error*) MaxwellJuttnerCorr requires an even number of "
+                          << "particles per cell (ppc.x * ppc.y), got "
+                          << ppc.x * ppc.y << "\n";
+                exit(1);
+            }
+        };
+
+        MaxwellJuttnerCorr * clone() const override { return new MaxwellJuttnerCorr(theta, ppc); };
+        void set( Particles & part, unsigned int seed ) const override ;
+    };
 }
 
 #endif
