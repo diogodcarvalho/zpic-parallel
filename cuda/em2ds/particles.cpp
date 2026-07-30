@@ -28,10 +28,15 @@ void np_total(
 ) {
     __shared__ uint32_t block_np;
     block_np = 0;
-    uint32_t thread_np = np[ blockIdx.x * blockDim.x + threadIdx.x ];
+
+    // The grid is rounded up to whole blocks, so the excess threads must
+    // contribute the reduction identity instead of reading past np[]. They
+    // cannot return early: the warp reduction below needs every lane.
+    const uint32_t tile_id = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t thread_np = ( tile_id < ntiles ) ? np[ tile_id ] : 0;
     block::sync();
 
-    thread_np = warp::reduce_add( thread_np );  
+    thread_np = warp::reduce_add( thread_np );
     if ( warp::thread_rank() == 0 ) block::atomic_fetch_add( &block_np, thread_np );
     block::sync();
 
@@ -77,10 +82,13 @@ void np_max_tile(
 ) {
     __shared__ uint32_t block_max;
     block_max = 0;
-    uint32_t thread_np = np[ blockIdx.x * blockDim.x + threadIdx.x ];
+
+    // See np_total: the excess threads of the last block must not read np[]
+    const uint32_t tile_id = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t thread_np = ( tile_id < ntiles ) ? np[ tile_id ] : 0;
     block::sync();
 
-    thread_np = warp::reduce_max( thread_np );  
+    thread_np = warp::reduce_max( thread_np );
     if ( warp::thread_rank() == 0 ) block::atomic_fetch_max( &block_max, thread_np );
     block::sync();
 
@@ -124,10 +132,13 @@ void np_min_tile(
 ) {
     __shared__ uint32_t block_min;
     block_min = UINT32_MAX;
-    uint32_t thread_np = np[ blockIdx.x * blockDim.x + threadIdx.x ];
+
+    // See np_total: the excess threads of the last block must not read np[]
+    const uint32_t tile_id = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t thread_np = ( tile_id < ntiles ) ? np[ tile_id ] : UINT32_MAX;
     block::sync();
 
-    thread_np = warp::reduce_min( thread_np );  
+    thread_np = warp::reduce_min( thread_np );
     if ( warp::thread_rank() == 0 ) block::atomic_fetch_min( &block_min, thread_np );
     block::sync();
 

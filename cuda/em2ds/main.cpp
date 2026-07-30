@@ -340,6 +340,112 @@ void test_weibel( ) {
 }
 
 
+/**
+ * @brief Regression test for the particle count reductions (`-t np_total`)
+ *
+ * `Particles::np_total()` and `np_max_tile()` launch one thread per tile with
+ * the grid rounded up to whole blocks of 1024. When the tile count is above
+ * 1024 and not a multiple of it, the excess threads index past the end of
+ * `np[]` and fold whatever is in that memory into the reduction.
+ *
+ * Injection uses the standard uniform density with ppc > 1 of test_weibel, so
+ * the count is known exactly: gnx.x * gnx.y * ppc.x * ppc.y particles, all
+ * tiles holding the same nx.x * nx.y * ppc.x * ppc.y. Tile counts at or below
+ * one block are included as controls -- they must pass both before and after
+ * the fix, which is what pins the failure on the reduction rather than on the
+ * per-tile counts written by `np_inject`.
+ *
+ * A uniform species takes its charge normalization from ppc, so there a wrong
+ * total only corrupts the size of the particle dumps. Lattice and Sparse
+ * instead divide n0 by the injected count in `norm_charge`, so for those the
+ * macroparticle charge -- and with it the plasma density actually simulated --
+ * is off by the same factor.
+ */
+void test_np_total( ) {
+
+    std::cout << ansi::bold
+              << "Running " << __func__ << "()..."
+              << ansi::reset << std::endl;
+
+    // Tiles are deliberately small: the bug depends on the number of tiles, not
+    // on the grid size, so there is no reason to pay for a test_weibel-sized
+    // grid on top of the 2048-tile case.
+    const uint2 nx  { 16, 16 };
+    const uint2 ppc {  4,  4 };
+    const float dx  = 0.1f;
+
+    /// @brief Tile geometry to test, with the reason it is interesting
+    struct testcase {
+        uint2 ntiles;
+        const char * note;
+    };
+
+    const testcase cases[] = {
+        { { 16, 16 }, "below one block"                 },
+        { { 32, 32 }, "exactly one block"               },
+        { { 33, 32 }, "one block + 32"                  },
+        { { 40, 40 }, "as runs/20 boosted-dx-001"       },
+        { { 64, 32 }, "exactly two blocks"              },
+    };
+    const int ncases = sizeof( cases ) / sizeof( cases[0] );
+
+    std::cout << "nx (tile) : " << nx  << '\n';
+    std::cout << "ppc       : " << ppc << '\n';
+    std::cout << "dx        : " << dx  << "\n\n";
+
+    // Uniform density places ppc particles in every cell, so every tile holds
+    // the same number and np_max_tile is predictable
+    const unsigned long np_tile_expected =
+        ( unsigned long ) nx.x * nx.y * ppc.x * ppc.y;
+
+    int nfail = 0;
+
+    for ( auto const & c : cases ) {
+
+        const uint2 ntiles = c.ntiles;
+        const uint2 gnx { ntiles.x * nx.x, ntiles.y * nx.y };
+
+        const unsigned long ntiles_tot  = ( unsigned long ) ntiles.x * ntiles.y;
+        const unsigned long np_expected = np_tile_expected * ntiles_tot;
+
+        const float2 box = dx * make_float2( gnx.x, gnx.y );
+
+        // Species::initialize() runs the full injection path on its own, so the
+        // test does not need a Simulation (nor its FFT plans and field grids).
+        Species electrons( "electrons", -1.0f, ppc );
+        electrons.set_density( Density::Uniform( 1.0f ) );
+        electrons.set_udist(
+            UDistribution::ThermalCorr( float3{ 0.1, 0.1, 0.1 }, float3{ 0, 0, 0 } )
+        );
+        electrons.initialize( box, ntiles, nx, 0.01f, 1 );
+
+        const unsigned long np_reduction  = electrons.np_total();
+        const unsigned long npt_reduction = electrons.np_max_tile();
+
+        const bool ok = ( np_reduction  == np_expected      ) &&
+                        ( npt_reduction == np_tile_expected );
+
+        std::cout << ansi::bold << "ntiles = " << ntiles << ansi::reset
+                  << "  (" << ntiles_tot << " tiles, " << c.note << ")\n";
+        std::cout << "  np_total()    : " << np_reduction  << " (expected " << np_expected      << ")\n";
+        std::cout << "  np_max_tile() : " << npt_reduction << " (expected " << np_tile_expected << ")\n";
+        std::cout << "  " << ansi::bold << ( ok ? "PASS" : "FAIL" ) << ansi::reset << "\n\n";
+
+        if ( ! ok ) nfail++;
+    }
+
+    if ( nfail ) {
+        std::cout << ansi::bold << nfail << " of " << ncases << " cases FAILED"
+                  << ansi::reset << '\n';
+        // std::exit, not device::exit: the latter recurses into itself (gpu.h)
+        std::exit(1);
+    }
+
+    std::cout << ansi::bold << "All " << ncases << " cases passed."
+              << ansi::reset << '\n';
+}
+
+
 void test_sparse( std::string param ) {
 
     std::cout << ansi::bold
@@ -368,6 +474,7 @@ void test_sparse( std::string param ) {
     float filter_sigma = 0.707107f;      // gaussian width in cells (gaussian only; sqrt(1/2) = binomial order 1)
     unsigned seed  = 0;                  // RNG seed offset (vary for independent replicas)
     uint  save_part = 1;                 // dump particle phase space at each diag (0 = energy only, e.g. warm-up probe)
+    uint  save_fld  = 1;                 // dump E, B, J and charge grids at each diag (0 = skip; the grids dominate the output of high-resolution, low-particle-count runs)
     float dump_start = 0.0f;             // write field/particle dumps only from t >= this (in 1/w_p); energy is logged from t=0
     std::string init = "poisson";        // field initialization: poisson | darwin | none
     uint  darwin_iter = 2;               // number of Darwin bootstrap passes (init=darwin only)
@@ -411,6 +518,7 @@ void test_sparse( std::string param ) {
         else if ( key == "filter_sigma") { got = std::sscanf( val.c_str(), "%f",       &filter_sigma );           want = 1; }
         else if ( key == "seed"       ) { got = std::sscanf( val.c_str(), "%u",       &seed );                    want = 1; }
         else if ( key == "save_part"  ) { got = std::sscanf( val.c_str(), "%u",       &save_part );               want = 1; }
+        else if ( key == "save_fld"   ) { got = std::sscanf( val.c_str(), "%u",       &save_fld );                want = 1; }
         else if ( key == "dump_start" ) { got = std::sscanf( val.c_str(), "%f",       &dump_start );              want = 1; }
         else if ( key == "init"       ) { init = val; got = 1;                                                    want = 1; }
         else if ( key == "darwin_iter") { got = std::sscanf( val.c_str(), "%u",       &darwin_iter );             want = 1; }
@@ -453,6 +561,7 @@ void test_sparse( std::string param ) {
                                                     filter_mode == "gaussian" ? " (sigma=" + std::to_string(filter_sigma) + " cells)" : "" ) << '\n';
     std::cout << "seed      : " << seed    << '\n';
     std::cout << "save_part : " << save_part << '\n';
+    std::cout << "save_fld  : " << save_fld  << '\n';
     std::cout << "dump_start: " << dump_start << " (field/particle dumps from t >= this)\n";
     std::cout << "init      : " << init    << ( init == "darwin" ? " (iter=" + std::to_string(darwin_iter) + ")" : "" ) << '\n';
 
@@ -543,20 +652,22 @@ void test_sparse( std::string param ) {
         // Heavy field / particle dumps only from t >= dump_start; the energy
         // report is always written so the budget is tracked from t = 0.
         if ( sim.get_t() >= dump_start ) {
-            sim.emf.save(emf::e, fcomp::x);
-            sim.emf.save(emf::e, fcomp::y);
-            sim.emf.save(emf::e, fcomp::z);
+            if ( save_fld ) {
+                sim.emf.save(emf::e, fcomp::x);
+                sim.emf.save(emf::e, fcomp::y);
+                sim.emf.save(emf::e, fcomp::z);
 
-            sim.emf.save(emf::b, fcomp::x);
-            sim.emf.save(emf::b, fcomp::y);
-            sim.emf.save(emf::b, fcomp::z);
+                sim.emf.save(emf::b, fcomp::x);
+                sim.emf.save(emf::b, fcomp::y);
+                sim.emf.save(emf::b, fcomp::z);
 
-            sim.current.save(fcomp::x);
-            sim.current.save(fcomp::y);
-            sim.current.save(fcomp::z);
+                sim.current.save(fcomp::x);
+                sim.current.save(fcomp::y);
+                sim.current.save(fcomp::z);
 
-            sim.charge.save();
-            electrons.save_charge();
+                sim.charge.save();
+                electrons.save_charge();
+            }
 
             if ( save_part )
                 electrons.save();
@@ -627,6 +738,8 @@ void cli_help( char * argv0 ) {
     std::cerr << "  -h                  Display this message and exit\n";
     std::cerr << "  -s                  Silence information about host/CUDA device\n";
     std::cerr << "  -t <name>           Name of the test to run. Defaults to 'weibel'\n";
+    std::cerr << "                      'np_total' runs the particle count reduction check\n";
+    std::cerr << "                      (takes no -p parameters) and exits nonzero on failure\n";
     std::cerr << "  -p <parameters>     Test parameters (string). Purpose will depend on the \n";
     std::cerr << "                      test chosen. Defaults to '2,2,16,16'\n";
     std::cerr << '\n';
@@ -822,6 +935,8 @@ int main( int argc, char *argv[] ) {
     // test_weibel();
     if ( test == "pair" )
         test_boosted_pair( param );
+    else if ( test == "np_total" )
+        test_np_total();
     else
         test_sparse( param );
 }
