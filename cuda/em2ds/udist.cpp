@@ -316,6 +316,112 @@ void maxwell_juttner_corr( ParticleData const part, uint2 rnd_seed, const float 
     }
 }
 
+/**
+ * @brief Scrambles a stream key
+ *
+ * `zrandom::rand_init()` seeds the MWC lanes additively, so consecutive keys - which
+ * here means neighbouring sub-areas - start from adjacent states. Since the whole
+ * point of this loader is to suppress correlated long wavelength noise, the key is
+ * scrambled first. This is the splitmix32 finalizer, a bijection on uint32, so
+ * distinct keys keep mapping to distinct streams.
+ */
+__device__ __inline__
+unsigned int scramble( unsigned int key )
+{
+    key ^= key >> 16; key *= 0x21f0aaad;
+    key ^= key >> 15; key *= 0x735a2d97;
+    key ^= key >> 15;
+    return key;
+}
+
+__global__
+void maxwell_juttner_corr_group( ParticleData const part, uint2 rnd_seed, const float theta,
+    uint2 const group, int * const __restrict__ odd_groups )
+{
+    const uint2 tile_idx = { blockIdx.x, blockIdx.y };
+    const int   tile_id  = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const auto  tile_off = part.offset[ tile_id ];
+    const auto  tile_np  = part.np[ tile_id ];
+
+    float3 * __restrict__ const u  = &part.u [ tile_off ];
+    int2   * __restrict__ const ix = &part.ix[ tile_off ];
+
+    // Sub-area grid inside the tile. `group` divides `nx` (checked on the host) so a
+    // sub-area never straddles a tile boundary, which blocks could not handle.
+    const int gstride = part.nx.x / group.x;
+    const int ngroups = gstride * ( part.nx.y / group.y );
+
+    // Get shared memory addresses
+    extern __shared__ char block_shm[];
+
+    // Particle counter per sub-area, reused as the rank counter after the scan
+    int * const __restrict__ npgroup   = reinterpret_cast<int*> ( & block_shm[0] );
+    // Index of the first antithetic pair of each sub-area, within this tile
+    int * const __restrict__ pair_base = & npgroup[ ngroups ];
+
+    for( auto idx = block_thread_rank(); idx < ngroups; idx += block_num_threads() ) {
+        npgroup[idx] = 0;
+    }
+
+    block_sync();
+
+    // Count the particles of each sub-area
+    for( auto i = block_thread_rank(); i < tile_np; i += block_num_threads() ) {
+        int const idx = ( ix[i].x / group.x ) + gstride * ( ix[i].y / group.y );
+        block::atomic_fetch_add( & npgroup[idx], 1 );
+    }
+
+    block_sync();
+
+    // Serial exclusive scan of the number of pairs per sub-area. `ngroups` is at most
+    // the number of cells in a tile and this runs once per simulation, so a single
+    // thread is fast enough and much clearer than a chunked block scan.
+    if ( block_thread_rank() == 0 ) {
+        int base = 0;
+        int odd = 0;
+        for( int idx = 0; idx < ngroups; idx++ ) {
+            int const np = npgroup[idx];
+            odd += ( np & 1 );
+            pair_base[idx] = base;
+            // ceil() so that an odd (invalid) count still gets a private key range
+            base += ( np + 1 ) / 2;
+            // Reuse the counter for the particle ranks below
+            npgroup[idx] = 0;
+        }
+        if ( odd ) device::atomic_fetch_add( odd_groups, odd );
+    }
+
+    block_sync();
+
+    for( auto i = block_thread_rank(); i < tile_np; i += block_num_threads() ) {
+
+        int const idx = ( ix[i].x / group.x ) + gstride * ( ix[i].y / group.y );
+
+        // Rank of this particle inside its sub-area. Ranks (2p, 2p+1) form an
+        // antithetic pair: both draw the same momentum, the odd one takes -u. The
+        // distribution is isotropic so f(u) stays exactly Maxwell-Jüttner, while
+        // sum(u) - and, since gamma(|u|) is even in u, sum(v) - over the sub-area
+        // becomes exactly 0.
+        int const rank = block::atomic_fetch_add( & npgroup[idx], 1 );
+
+        // As in kernel::maxwell_juttner_corr the two members of a pair never
+        // communicate: they agree on the momentum by seeding the same stream, keyed on
+        // (sub-area, pair). Unlike that kernel the key needs no particles-per-cell
+        // stride: the number of pairs preceding this sub-area in the tile comes from
+        // the scan above, and sum(ceil(np/2)) <= tile_np, so the key stays inside
+        // [tile_off, tile_off + tile_np) and never collides with another tile.
+        uint2 state;
+        zrandom::rand_init(
+            scramble( tile_off + pair_base[idx] + ( rank >> 1 ) ),
+            rnd_seed, state
+        );
+
+        float const sign = ( rank & 1 ) ? -1.f : +1.f;
+        u[i] = maxwell_juttner_sample( state, theta ) * sign;
+    }
+}
+
 }
 
 /**
@@ -351,4 +457,53 @@ void UDistribution::MaxwellJuttnerCorr::set( Particles & part, unsigned int seed
     block::set_shmem_size( kernel::maxwell_juttner_corr, shm_size );
     kernel::maxwell_juttner_corr <<< grid, block, shm_size >>> (
         part, rnd_seed, theta, ppc.x * ppc.y );
+}
+
+/**
+ * @brief Sets a Maxwell-Jüttner momentum distribution with zero net current per sub-area
+ *
+ * Same sampling as MaxwellJuttner, but the particles of each sub-area (a block of
+ * `group` cells, e.g. a Debye square) are loaded as antithetic pairs ( u, -u ), so every
+ * sub-area carries exactly zero net momentum and zero net current, and no magnetic field
+ * is seeded below k ~ 2 pi / ( group * dx ).
+ *
+ * This is the loader for ppc < 1 (sparse / lattice) densities, where a cell holds at
+ * most one particle and MaxwellJuttnerCorr cannot pair anything.
+ */
+void UDistribution::MaxwellJuttnerCorrGroup::set( Particles & part, unsigned int seed ) const
+{
+    // A sub-area must not straddle a tile boundary
+    if ( part.nx.x % group.x || part.nx.y % group.y ) {
+        std::cout << "(*error*) MaxwellJuttnerCorrGroup group size (" << group.x << ","
+                  << group.y << ") does not divide the tile size (" << part.nx.x << ","
+                  << part.nx.y << ")\n";
+        exit(1);
+    }
+
+    uint2 rnd_seed{ 12345 + seed, 67890 };
+    dim3 grid( part.ntiles.x, part.ntiles.y );
+    dim3 block( 64 );
+
+    const auto ngroups = ( part.nx.x / group.x ) * ( part.nx.y / group.y );
+    // Particle counter + first pair index, per sub-area
+    const size_t shm_size = 2 * ngroups * sizeof( int );
+
+    // Number of sub-areas holding an odd number of particles, i.e. with one particle
+    // left without a partner
+    device::Var<int> odd_groups( 0 );
+
+    block::set_shmem_size( kernel::maxwell_juttner_corr_group, shm_size );
+    kernel::maxwell_juttner_corr_group <<< grid, block, shm_size >>> (
+        part, rnd_seed, theta, group, odd_groups.ptr() );
+
+    // Also synchronizes with the kernel above
+    const int odd = odd_groups.get();
+    if ( odd > 0 ) {
+        std::cout << "(*error*) MaxwellJuttnerCorrGroup: " << odd
+                  << " sub-areas of (" << group.x << "," << group.y << ") cells hold an "
+                  << "odd number of particles, antithetic pairing cannot cancel them.\n"
+                  << "(*error*) Adjust the group size or the macroparticle spacing so "
+                  << "that every sub-area holds an even number of particles.\n";
+        exit(1);
+    }
 }

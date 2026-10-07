@@ -94,6 +94,34 @@ namespace UDistribution {
         MaxwellJuttnerCorr * clone() const override { return new MaxwellJuttnerCorr(theta, ppc); };
         void set( Particles & part, unsigned int seed ) const override ;
     };
+
+    class MaxwellJuttnerCorrGroup : public Type {
+
+        public:
+        const float theta;    // normalized temperature kT/(mc^2)
+        const uint2 group;    // sub-area size in grid cells, must divide the tile size
+
+        // Antithetic pairs are formed inside a sub-area of `group` cells (e.g. a Debye
+        // square) instead of inside a single cell. This is the ppc < 1 loader: with the
+        // sparse / lattice density profiles a cell holds 0 or 1 particles, so the pairs
+        // must be built over a larger region. Every sub-area must hold an even number of
+        // particles; this is checked at run time in set().
+        MaxwellJuttnerCorrGroup( float const theta, uint2 const group ) : theta(theta), group(group) {
+            if ( theta <= 0 ) {
+                std::cout << "(*error*) MaxwellJuttnerCorrGroup requires theta > 0\n";
+                exit(1);
+            }
+            if ( group.x < 1 || group.y < 1 ) {
+                std::cout << "(*error*) MaxwellJuttnerCorrGroup requires a group size of at "
+                          << "least 1 cell in each direction, got " << group.x << ","
+                          << group.y << "\n";
+                exit(1);
+            }
+        };
+
+        MaxwellJuttnerCorrGroup * clone() const override { return new MaxwellJuttnerCorrGroup(theta, group); };
+        void set( Particles & part, unsigned int seed ) const override ;
+    };
 }
 
 #endif
