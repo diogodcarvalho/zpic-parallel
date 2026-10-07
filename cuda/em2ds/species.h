@@ -164,6 +164,10 @@ public:
     /// @brief Base RNG seed for the initial velocity distribution
     unsigned int seed = 0;
 
+    /// @brief Load the initial ppc as ppc/2 lattice sites, each holding a ( u, -u ) pair at
+    ///        the same position, so the initial current is exactly zero (needs even ppc)
+    bool mirror = false;
+
     /**
      * @brief Construct a new Species object
      * 

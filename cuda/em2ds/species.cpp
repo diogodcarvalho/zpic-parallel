@@ -2302,6 +2302,39 @@ void Species::save_phasespace(
     device::free( d_data );
 }
 
+namespace kernel {
+
+/**
+ * @brief Appends a mirror copy ( same position, -u ) of every particle in the tile
+ *
+ * @note The tile buffer must have room for 2 * np particles
+ *
+ * @param part  Particle data
+ */
+__global__
+void mirror_pairs( ParticleData const part )
+{
+    const uint2 tile_idx = { blockIdx.x, blockIdx.y };
+    const int   tile_id  = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const auto  tile_off = part.offset[ tile_id ];
+    const auto  tile_np  = part.np[ tile_id ];
+
+    int2   * __restrict__ const ix = &part.ix[ tile_off ];
+    float2 * __restrict__ const x  = &part.x [ tile_off ];
+    float3 * __restrict__ const u  = &part.u [ tile_off ];
+
+    for( auto i = block_thread_rank(); i < tile_np; i += block_num_threads() ) {
+        ix[ tile_np + i ] =  ix[i];
+        x [ tile_np + i ] =  x [i];
+        u [ tile_np + i ] =  u [i] * -1.f;
+    }
+
+    if ( block_thread_rank() == 0 ) part.np[ tile_id ] = 2 * tile_np;
+}
+
+}
+
 /**
  * @brief Initialize data structures and inject particles
  * 
@@ -2359,12 +2392,20 @@ void Species::initialize( float2 const box_, uint2 const ntiles, uint2 const nx,
     device::exscan_add( particles -> offset, np_inj, ntiles.x * ntiles.y );
 
     // Inject the particles
-    inject( particles -> g_range() );
-    std::printf( "[%s] injected np_total=%lu particles\n", name.c_str(), particles->np_total() );
-
-    // Assign a unique tag to every injected particle (buffer is still compact)
-    if ( add_tag )
-        particles -> set_tags();
+    if ( mirror ) {
+        // Inject only half the lattice, the mirror copies below fill the other half. The
+        // offsets above were counted with the full ppc, so they already leave room for them.
+        if ( ( ppc.x * ppc.y ) % 2 ) {
+            std::cerr << "(*error*) [" << name << "] mirror requires an even number of "
+                      << "particles per cell (ppc.x * ppc.y), got " << ppc.x * ppc.y << '\n';
+            exit(1);
+        }
+        uint2 const ppc_half = ( ppc.y % 2 == 0 ) ? make_uint2( ppc.x, ppc.y / 2 ) :
+                                                    make_uint2( ppc.x / 2, ppc.y );
+        density -> inject( *particles, ppc_half, dx, make_float2( 0, 0 ), particles -> g_range() );
+    } else {
+        inject( particles -> g_range() );
+    }
 
     // Set charge normalization factor
     // Computed after injection so count-based profiles (e.g. Sparse) can use the
@@ -2375,6 +2416,19 @@ void Species::initialize( float2 const box_, uint2 const ntiles, uint2 const nx,
     // per-species seed so independent replicas (same physics, different seed)
     // draw distinct velocity realizations.
     udist -> set( *particles, id + seed );
+
+    // Complete the lattice with a ( u, -u ) partner on top of every injected particle
+    if ( mirror ) {
+        dim3 grid( ntiles.x, ntiles.y );
+        dim3 block( 1024 );
+        kernel::mirror_pairs <<< grid, block >>> ( *particles );
+    }
+    std::printf( "[%s] injected np_total=%lu particles%s\n", name.c_str(), particles->np_total(),
+                 mirror ? " (mirrored pairs)" : "" );
+
+    // Assign a unique tag to every injected particle (buffer is still compact)
+    if ( add_tag )
+        particles -> set_tags();
 
     // particles -> validate( "After initial injection");
 }

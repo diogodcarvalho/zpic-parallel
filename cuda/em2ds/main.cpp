@@ -471,6 +471,7 @@ void test_sparse( std::string param ) {
     std::string udist = "thermal";       // momentum distribution: thermal | maxwell_juttner
     float theta   = 0.0f;                // normalized temperature kT/mc^2 (maxwell_juttner only)
     uint2  corr_group{ 0, 0 };           // antithetic pair sub-area, in cells (maxwell_juttner_corr_group only)
+    uint  mirror  = 0;                   // load ppc/2 lattice sites, each with a ( u, -u ) pair at the same position (J = 0 at t=0)
     std::string filter_mode = "lowpass"; // source filter: none | lowpass | binomial | gaussian
     unsigned filter_order = 1;           // binomial filter order (binomial only)
     unsigned filter_comp = 0;            // binomial compensator order (binomial only; 0 = no compensator)
@@ -509,6 +510,7 @@ void test_sparse( std::string param ) {
         else if ( key == "theta"      ) { got = std::sscanf( val.c_str(), "%f",       &theta );                want = 1; }
         else if ( key == "corr_group" ) { got = std::sscanf( val.c_str(), "%u,%u",    &corr_group.x, &corr_group.y );
                                           if ( got == 1 ) { corr_group.y = corr_group.x; got = 2; }              want = 2; }
+        else if ( key == "mirror"     ) { got = std::sscanf( val.c_str(), "%u",       &mirror );                want = 1; }
         else if ( key == "n_dump"     ) { got = std::sscanf( val.c_str(), "%u",       &n_dump );                want = 1; }
         else if ( key == "n_skip"     ) { got = std::sscanf( val.c_str(), "%u",       &n_skip );                want = 1; }
         else if ( key == "tmax"       ) { got = std::sscanf( val.c_str(), "%f",       &tmax );                  want = 1; }
@@ -575,6 +577,7 @@ void test_sparse( std::string param ) {
     std::cout << "udist     : " << udist   << ( udist.rfind( "maxwell_juttner", 0 ) == 0 ? " (theta=" + std::to_string(theta) + ")" : "" ) << '\n';
     if ( udist == "maxwell_juttner_corr_group" )
         std::cout << "corr_group: " << corr_group << " cells (antithetic pair sub-area)\n";
+    std::cout << "mirror    : " << mirror  << ( mirror ? " (( u, -u ) pairs at the same position)" : "" ) << '\n';
     std::cout << "uth       : " << uth     << '\n';
     std::cout << "ufl       : " << ufl     << '\n';
     std::cout << "filter    : " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) +
@@ -648,6 +651,22 @@ void test_sparse( std::string param ) {
         electrons.set_density(
             Density::Sparse(density, float2{ dx_part, dx_part })
         );
+    if ( mirror ) {
+        // The mirror copies double a half-ppc lattice, so the profile must be ppc based
+        if ( ! uniform ) {
+            std::cerr << "mirror=1 requires a uniform density (set ppc)\n";
+            std::exit(1);
+        }
+        // Darwin / boosted build E_T from the v v stress term, which the pairs do not cancel
+        if ( init_type == emf::init_type::darwin || init_type == emf::init_type::boosted )
+            std::cout << "(*warning*) mirror=1 zeroes the initial current, use init=none "
+                      << "(init=" << init << " still seeds transverse fields)\n";
+        if ( ufl.x != 0 || ufl.y != 0 || ufl.z != 0 )
+            std::cout << "(*warning*) mirror=1 flips u -> -u, so the fluid velocity ufl is "
+                      << "cancelled\n";
+    }
+    electrons.mirror = ( mirror != 0 );
+
     if ( udist == "maxwell_juttner" )
         electrons.set_udist(
             UDistribution::MaxwellJuttner( theta )
