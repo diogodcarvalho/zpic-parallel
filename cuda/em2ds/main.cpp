@@ -6,6 +6,7 @@
 #include <sstream>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 
 #include "gpu.h"
 #include "utils.h"
@@ -469,15 +470,20 @@ void test_sparse( std::string param ) {
     float3 ufl    { 0.0f, 0.0f, 0.0f };  // fluid velocity
     std::string udist = "thermal";       // momentum distribution: thermal | maxwell_juttner
     float theta   = 0.0f;                // normalized temperature kT/mc^2 (maxwell_juttner only)
+    uint2  corr_group{ 0, 0 };           // antithetic pair sub-area, in cells (maxwell_juttner_corr_group only)
     std::string filter_mode = "lowpass"; // source filter: none | lowpass | binomial | gaussian
     unsigned filter_order = 1;           // binomial filter order (binomial only)
+    unsigned filter_comp = 0;            // binomial compensator order (binomial only; 0 = no compensator)
     float filter_sigma = 0.707107f;      // gaussian width in cells (gaussian only; sqrt(1/2) = binomial order 1)
-    unsigned seed  = 0;                  // RNG seed offset (vary for independent replicas)
+    unsigned seed  = 0;                 // RNG seed offset (vary for independent replicas)
     uint  save_part = 1;                 // dump particle phase space at each diag (0 = energy only, e.g. warm-up probe)
     uint  save_fld  = 1;                 // dump E, B, J and charge grids at each diag (0 = skip; the grids dominate the output of high-resolution, low-particle-count runs)
+    uint  save_src  = 1;                 // include the J and charge grids in the field dumps (0 = E, B only)
+    uint  n_dump_fld = 0;                // field dump interval (in number of timesteps, multiple of n_dump; 0 = n_dump)
     float dump_start = 0.0f;             // write field/particle dumps only from t >= this (in 1/w_p); energy is logged from t=0
     std::string init = "poisson";        // field initialization: poisson | darwin | none
     uint  darwin_iter = 2;               // number of Darwin bootstrap passes (init=darwin only)
+    uint  darwin_gamma_corr = 0;         // apply the relativistic <1/gamma> correction to the Darwin reference wp2 (init=darwin only)
 
     // Parse whitespace-separated "key=value" pairs. 
     // Vector values are comma-separated, e.g. "ntiles=4,4" or "uth=0.1,0,0".
@@ -501,6 +507,8 @@ void test_sparse( std::string param ) {
         else if ( key == "ufl"        ) { got = std::sscanf( val.c_str(), "%f,%f,%f", &ufl.x, &ufl.y, &ufl.z ); want = 3; }
         else if ( key == "udist"      ) { udist = val; got = 1;                                                want = 1; }
         else if ( key == "theta"      ) { got = std::sscanf( val.c_str(), "%f",       &theta );                want = 1; }
+        else if ( key == "corr_group" ) { got = std::sscanf( val.c_str(), "%u,%u",    &corr_group.x, &corr_group.y );
+                                          if ( got == 1 ) { corr_group.y = corr_group.x; got = 2; }              want = 2; }
         else if ( key == "n_dump"     ) { got = std::sscanf( val.c_str(), "%u",       &n_dump );                want = 1; }
         else if ( key == "n_skip"     ) { got = std::sscanf( val.c_str(), "%u",       &n_skip );                want = 1; }
         else if ( key == "tmax"       ) { got = std::sscanf( val.c_str(), "%f",       &tmax );                  want = 1; }
@@ -515,13 +523,17 @@ void test_sparse( std::string param ) {
                                           else                                        filter_mode = val;
                                           got = 1; want = 1; }
         else if ( key == "filter_order") { got = std::sscanf( val.c_str(), "%u",       &filter_order );           want = 1; }
+        else if ( key == "filter_comp" ) { got = std::sscanf( val.c_str(), "%u",       &filter_comp );            want = 1; }
         else if ( key == "filter_sigma") { got = std::sscanf( val.c_str(), "%f",       &filter_sigma );           want = 1; }
-        else if ( key == "seed"       ) { got = std::sscanf( val.c_str(), "%u",       &seed );                    want = 1; }
+        else if ( key == "seed"     ) { got = std::sscanf( val.c_str(), "%u",       &seed );                    want = 1; }
         else if ( key == "save_part"  ) { got = std::sscanf( val.c_str(), "%u",       &save_part );               want = 1; }
         else if ( key == "save_fld"   ) { got = std::sscanf( val.c_str(), "%u",       &save_fld );                want = 1; }
+        else if ( key == "save_src"   ) { got = std::sscanf( val.c_str(), "%u",       &save_src );                want = 1; }
+        else if ( key == "n_dump_fld" ) { got = std::sscanf( val.c_str(), "%u",       &n_dump_fld );              want = 1; }
         else if ( key == "dump_start" ) { got = std::sscanf( val.c_str(), "%f",       &dump_start );              want = 1; }
         else if ( key == "init"       ) { init = val; got = 1;                                                    want = 1; }
         else if ( key == "darwin_iter") { got = std::sscanf( val.c_str(), "%u",       &darwin_iter );             want = 1; }
+        else if ( key == "darwin_gamma_corr" ) { got = std::sscanf( val.c_str(), "%u", &darwin_gamma_corr );      want = 1; }
         else {
             std::cerr << "Unknown parameter key: '" << key << "'\n";
             std::exit(1);
@@ -536,6 +548,12 @@ void test_sparse( std::string param ) {
     if ( filter_order < 1 ) filter_order = 1;
     // Gaussian filter width must be positive (matches Filter::Gaussian clamp)
     if ( filter_sigma <= 0 ) filter_sigma = 0.707107f;
+    // Field dumps happen inside diag(), so their interval must be a multiple of n_dump
+    if ( n_dump_fld == 0 ) n_dump_fld = n_dump;
+    if ( n_dump_fld % n_dump ) {
+        std::cerr << "n_dump_fld (" << n_dump_fld << ") must be a multiple of n_dump (" << n_dump << ")\n";
+        std::exit(1);
+    }
 
     float2 box = dx * make_float2( ntiles.x * nx.x, ntiles.y * nx.y );
 
@@ -555,15 +573,19 @@ void test_sparse( std::string param ) {
     std::cout << "n_skip    : " << n_skip  << " (first dump at t = " << n_skip * dt << ")\n";
     std::cout << "tmax      : " << tmax    << '\n';
     std::cout << "udist     : " << udist   << ( udist.rfind( "maxwell_juttner", 0 ) == 0 ? " (theta=" + std::to_string(theta) + ")" : "" ) << '\n';
+    if ( udist == "maxwell_juttner_corr_group" )
+        std::cout << "corr_group: " << corr_group << " cells (antithetic pair sub-area)\n";
     std::cout << "uth       : " << uth     << '\n';
     std::cout << "ufl       : " << ufl     << '\n';
-    std::cout << "filter    : " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) + ")" :
+    std::cout << "filter    : " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) +
+                                                                                 ", comp=" + std::to_string(filter_comp) + ")" :
                                                     filter_mode == "gaussian" ? " (sigma=" + std::to_string(filter_sigma) + " cells)" : "" ) << '\n';
     std::cout << "seed      : " << seed    << '\n';
     std::cout << "save_part : " << save_part << '\n';
-    std::cout << "save_fld  : " << save_fld  << '\n';
+    std::cout << "save_fld  : " << save_fld  << " (every " << n_dump_fld << " steps, J/charge " << ( save_src ? "on" : "off" ) << ")\n";
     std::cout << "dump_start: " << dump_start << " (field/particle dumps from t >= this)\n";
-    std::cout << "init      : " << init    << ( init == "darwin" ? " (iter=" + std::to_string(darwin_iter) + ")" : "" ) << '\n';
+    std::cout << "init      : " << init    << ( init == "darwin" ? " (iter=" + std::to_string(darwin_iter) +
+                                                 ", gamma_corr=" + std::to_string(darwin_gamma_corr) + ")" : "" ) << '\n';
 
     // Map the init string to the field initialization type
     emf::init_type::type init_type;
@@ -576,9 +598,11 @@ void test_sparse( std::string param ) {
         std::exit(1);
     }
 
-    if ( udist != "thermal" && udist != "maxwell_juttner" && udist != "maxwell_juttner_corr" ) {
+    if ( udist != "thermal" && udist != "maxwell_juttner" && udist != "maxwell_juttner_corr" &&
+         udist != "maxwell_juttner_corr_group" ) {
         std::cerr << "Unknown udist: '" << udist
-                  << "' (expected thermal, maxwell_juttner or maxwell_juttner_corr)\n";
+                  << "' (expected thermal, maxwell_juttner, maxwell_juttner_corr or "
+                  << "maxwell_juttner_corr_group)\n";
         std::exit(1);
     }
 
@@ -595,6 +619,9 @@ void test_sparse( std::string param ) {
     if ( filter_mode == "none" ) {
         sim.current.set_filter( Filter::None() );
         sim.charge.set_filter ( Filter::None() );
+    } else if ( filter_mode == "binomial" && filter_comp > 0 ) {
+        sim.current.set_filter( Filter::Compensated( filter_order, filter_comp ) );
+        sim.charge.set_filter ( Filter::Compensated( filter_order, filter_comp ) );
     } else if ( filter_mode == "binomial" ) {
         sim.current.set_filter( Filter::Binomial( filter_order ) );
         sim.charge.set_filter ( Filter::Binomial( filter_order ) );
@@ -636,6 +663,19 @@ void test_sparse( std::string param ) {
             UDistribution::MaxwellJuttnerCorr( theta, ppc )
         );
     }
+    else if ( udist == "maxwell_juttner_corr_group" ) {
+        // Antithetic pairs are built inside a sub-area of corr_group cells, so this
+        // works with any density profile, in particular the ppc < 1 sparse / lattice
+        // loads where a cell holds at most one particle.
+        if ( corr_group.x == 0 || corr_group.y == 0 ) {
+            std::cerr << "udist=maxwell_juttner_corr_group requires the pair sub-area "
+                      << "size (set corr_group, in cells)\n";
+            std::exit(1);
+        }
+        electrons.set_udist(
+            UDistribution::MaxwellJuttnerCorrGroup( theta, corr_group )
+        );
+    }
     else
         electrons.set_udist(
             UDistribution::ThermalCorr( uth, ufl )
@@ -645,14 +685,14 @@ void test_sparse( std::string param ) {
     sim.add_species( electrons );
 
     // Initialize fields, must be done before first advance()
-    sim.init_fields( init_type, darwin_iter );
+    sim.init_fields( init_type, darwin_iter, darwin_gamma_corr != 0 );
 
     // Lambda function for diagnostic output
     auto diag = [ & ]( ) {
         // Heavy field / particle dumps only from t >= dump_start; the energy
         // report is always written so the budget is tracked from t = 0.
         if ( sim.get_t() >= dump_start ) {
-            if ( save_fld ) {
+            if ( save_fld && ( sim.get_iter() - n_skip ) % n_dump_fld == 0 ) {
                 sim.emf.save(emf::e, fcomp::x);
                 sim.emf.save(emf::e, fcomp::y);
                 sim.emf.save(emf::e, fcomp::z);
@@ -661,12 +701,14 @@ void test_sparse( std::string param ) {
                 sim.emf.save(emf::b, fcomp::y);
                 sim.emf.save(emf::b, fcomp::z);
 
-                sim.current.save(fcomp::x);
-                sim.current.save(fcomp::y);
-                sim.current.save(fcomp::z);
+                if ( save_src ) {
+                    sim.current.save(fcomp::x);
+                    sim.current.save(fcomp::y);
+                    sim.current.save(fcomp::z);
 
-                sim.charge.save();
-                electrons.save_charge();
+                    sim.charge.save();
+                    electrons.save_charge();
+                }
             }
 
             if ( save_part )
@@ -740,6 +782,7 @@ void cli_help( char * argv0 ) {
     std::cerr << "  -t <name>           Name of the test to run. Defaults to 'weibel'\n";
     std::cerr << "                      'np_total' runs the particle count reduction check\n";
     std::cerr << "                      (takes no -p parameters) and exits nonzero on failure\n";
+    std::cerr << "                      'pair' / 'three' place 2 / 3 single point particles\n";
     std::cerr << "  -p <parameters>     Test parameters (string). Purpose will depend on the \n";
     std::cerr << "                      test chosen. Defaults to '2,2,16,16'\n";
     std::cerr << '\n';
@@ -754,14 +797,18 @@ void cli_help( char * argv0 ) {
  * the relativistic limit) or an interacting pair (where the uniform-motion boosted
  * field is only approximate). Selected with `-t pair`.
  *
+ * With `npart = 3` (`-t three`) a third single-Point species is added, e.g. for a
+ * three-body configuration in the box (default: equilateral triangle, side 16).
+ *
  * Params (key=value): ntiles, nx, dx, dt, tmax, n_dump, n_skip, save_part,
- *   p1="x,y", p2="x,y" (positions, sim units),
- *   u1="ux,uy,uz", u2="ux,uy,uz" (proper momentum u=gamma*beta),
- *   s1, s2 (charge signs, +1/-1), q (charge magnitude),
+ *   p1="x,y", p2="x,y", p3="x,y" (positions, sim units),
+ *   u1="ux,uy,uz", u2="ux,uy,uz", u3="ux,uy,uz" (proper momentum u=gamma*beta),
+ *   s1, s2, s3 (charge signs, +1/-1), q (charge magnitude),
  *   init (poisson|darwin|boosted|none), filter (none|lowpass|binomial|gaussian),
- *   filter_order (binomial), filter_sigma (gaussian).
+ *   filter_order, filter_comp (binomial), filter_sigma (gaussian).
+ *   The p3/u3/s3 keys are ignored unless npart = 3.
  */
-void test_boosted_pair( std::string param ) {
+void test_boosted_pair( std::string param, unsigned npart = 2 ) {
 
     std::cout << ansi::bold << "Running " << __func__ << "()..." << ansi::reset << std::endl;
 
@@ -783,11 +830,19 @@ void test_boosted_pair( std::string param ) {
     float  s1 = -1.0f, s2 = -1.0f;   // charge signs (mass/charge sign)
     float  q  = 1.0f;                // charge magnitude (macroparticle charge)
 
+    // Third particle (npart = 3 only). Default closes an equilateral triangle
+    // with p1, p2: side 16, apex at x = 64 + 8*sqrt(3).
+    float2 p3 { 77.8564f, 64.0f };
+    float3 u3 { 0.0f, 0.0f, 0.0f };
+    float  s3 = -1.0f;
+
     std::string init = "boosted";
     std::string filter_mode = "binomial";
     unsigned filter_order = 1;
+    unsigned filter_comp = 0;
     float filter_sigma = 0.707107f;
     uint darwin_iter = 2;
+    uint darwin_gamma_corr = 0;
 
     std::istringstream tokens( param );
     std::string tok;
@@ -810,14 +865,19 @@ void test_boosted_pair( std::string param ) {
         else if ( key == "u2"          ) { got = std::sscanf(val.c_str(),"%f,%f,%f",&u2.x,&u2.y,&u2.z);  want=3; }
         else if ( key == "s1"          ) { got = std::sscanf(val.c_str(),"%f",&s1);                      want=1; }
         else if ( key == "s2"          ) { got = std::sscanf(val.c_str(),"%f",&s2);                      want=1; }
+        else if ( key == "p3"          ) { got = std::sscanf(val.c_str(),"%f,%f",&p3.x,&p3.y);           want=2; }
+        else if ( key == "u3"          ) { got = std::sscanf(val.c_str(),"%f,%f,%f",&u3.x,&u3.y,&u3.z);  want=3; }
+        else if ( key == "s3"          ) { got = std::sscanf(val.c_str(),"%f",&s3);                      want=1; }
         else if ( key == "q"           ) { got = std::sscanf(val.c_str(),"%f",&q);                       want=1; }
         else if ( key == "init"        ) { init = val; got=1;                                            want=1; }
         else if ( key == "filter"      ) { if      (val=="0"||val=="off") filter_mode="none";
                                            else if (val=="1"||val=="on" ) filter_mode="lowpass";
                                            else                            filter_mode=val;   got=1; want=1; }
         else if ( key == "filter_order") { got = std::sscanf(val.c_str(),"%u",&filter_order);            want=1; }
+        else if ( key == "filter_comp" ) { got = std::sscanf(val.c_str(),"%u",&filter_comp);             want=1; }
         else if ( key == "filter_sigma") { got = std::sscanf(val.c_str(),"%f",&filter_sigma);            want=1; }
         else if ( key == "darwin_iter" ) { got = std::sscanf(val.c_str(),"%u",&darwin_iter);             want=1; }
+        else if ( key == "darwin_gamma_corr" ) { got = std::sscanf(val.c_str(),"%u",&darwin_gamma_corr); want=1; }
         else { std::cerr << "Unknown parameter key: '" << key << "'\n"; std::exit(1); }
         if ( got != want ) { std::cerr << "Invalid value for '" << key << "': '" << val << "'\n"; std::exit(1); }
     }
@@ -836,9 +896,13 @@ void test_boosted_pair( std::string param ) {
     std::cout << "box   : " << box << '\n';
     std::cout << "p1    : " << p1 << "  u1 : " << u1 << "  s1 : " << s1 << '\n';
     std::cout << "p2    : " << p2 << "  u2 : " << u2 << "  s2 : " << s2 << '\n';
+    if ( npart == 3 )
+        std::cout << "p3    : " << p3 << "  u3 : " << u3 << "  s3 : " << s3 << '\n';
     std::cout << "q     : " << q  << '\n';
-    std::cout << "init  : " << init << ( init == "darwin" ? " (iter=" + std::to_string(darwin_iter) + ")" : "" ) << '\n';
-    std::cout << "filter: " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) + ")" :
+    std::cout << "init  : " << init << ( init == "darwin" ? " (iter=" + std::to_string(darwin_iter) +
+                                         ", gamma_corr=" + std::to_string(darwin_gamma_corr) + ")" : "" ) << '\n';
+    std::cout << "filter: " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) +
+                                                                             ", comp=" + std::to_string(filter_comp) + ")" :
                                                 filter_mode == "gaussian" ? " (sigma=" + std::to_string(filter_sigma) + " cells)" : "" ) << '\n';
 
     Simulation sim( ntiles, nx, box, dt );
@@ -846,6 +910,9 @@ void test_boosted_pair( std::string param ) {
     if ( filter_mode == "none" ) {
         sim.current.set_filter( Filter::None() );
         sim.charge.set_filter ( Filter::None() );
+    } else if ( filter_mode == "binomial" && filter_comp > 0 ) {
+        sim.current.set_filter( Filter::Compensated( filter_order, filter_comp ) );
+        sim.charge.set_filter ( Filter::Compensated( filter_order, filter_comp ) );
     } else if ( filter_mode == "binomial" ) {
         sim.current.set_filter( Filter::Binomial( filter_order ) );
         sim.charge.set_filter ( Filter::Binomial( filter_order ) );
@@ -864,16 +931,26 @@ void test_boosted_pair( std::string param ) {
     sp2.set_density( Density::Point( q, p2 ) );
     sp2.set_udist ( UDistribution::Cold( u2 ) );
 
+    // Third species only constructed for npart = 3: ~Species frees np_inj, which
+    // is left uninitialized until the species is added to a simulation.
+    std::unique_ptr<Species> sp3;
+    if ( npart == 3 ) {
+        sp3.reset( new Species( "part3", s3, uint2{1,1}, true ) );
+        sp3 -> set_density( Density::Point( q, p3 ) );
+        sp3 -> set_udist ( UDistribution::Cold( u3 ) );
+    }
+
     sim.add_species( sp1 );
     sim.add_species( sp2 );
+    if ( sp3 ) sim.add_species( *sp3 );
 
-    sim.init_fields( init_type, darwin_iter );
+    sim.init_fields( init_type, darwin_iter, darwin_gamma_corr != 0 );
 
     auto diag = [&]() {
         sim.emf.save(emf::e, fcomp::x); sim.emf.save(emf::e, fcomp::y); sim.emf.save(emf::e, fcomp::z);
         sim.emf.save(emf::b, fcomp::x); sim.emf.save(emf::b, fcomp::y); sim.emf.save(emf::b, fcomp::z);
         sim.charge.save();
-        if ( save_part ) { sp1.save(); sp2.save(); }
+        if ( save_part ) { sp1.save(); sp2.save(); if ( sp3 ) sp3 -> save(); }
         sim.energy_info();
     };
 
@@ -935,6 +1012,8 @@ int main( int argc, char *argv[] ) {
     // test_weibel();
     if ( test == "pair" )
         test_boosted_pair( param );
+    else if ( test == "three" )
+        test_boosted_pair( param, 3 );
     else if ( test == "np_total" )
         test_np_total();
     else
