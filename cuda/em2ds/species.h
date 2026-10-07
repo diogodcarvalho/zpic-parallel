@@ -435,9 +435,26 @@ public:
      * Using `q` here scaled wp2 by the macroparticle charge, making the
      * implicit term ~q too small (dense case) and diverging the iteration.
      *
+     * With `gamma_corr` the result is multiplied by the measured < 1/gamma >:
+     * relativistically the velocity response to the field is dv/dt =
+     * (1/gamma)(1/m_q)[ E - v (v.E) ], so the response the implicit term must
+     * cancel is reduced by 1/gamma per particle. For a warm/relativistic load
+     * the uncorrected wp2 overshoots the response by <gamma>, which leaves the
+     * fixed-point iteration with a gain of ~(1 - <1/gamma>) at long wavelengths
+     * and slows convergence (it does NOT change the converged solution: at the
+     * fixed point the wp2 terms cancel and k^2 E_T + dJ_T/dt = 0 either way).
+     *
+     * @param gamma_corr    Include the relativistic < 1/gamma > correction
      * @return double
      */
-    double darwin_wp2() const { return density->n0 / std::fabs( double(m_q) ); }
+    double darwin_wp2( bool gamma_corr = false ) const;
+
+    /**
+     * @brief Particle average of the inverse Lorentz factor, < 1/gamma >
+     *
+     * @return double   < 1/gamma > (1 for a cold species, < 1 otherwise)
+     */
+    double mean_rgamma() const;
 
     /**
      * @brief Returns total time centered kinetic energy

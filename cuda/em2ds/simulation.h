@@ -81,8 +81,11 @@ class Simulation {
      * @param type          Initialization type
      * @param darwin_iter   Number of Darwin bootstrap passes (only used for the
      *                      darwin initialization type)
+     * @param darwin_gamma_corr  Apply the relativistic < 1/gamma > correction to the
+     *                      implicit reference wp2 (darwin initialization type only)
      */
-    void init_fields( emf::init_type::type type, unsigned int darwin_iter = 0 ) {
+    void init_fields( emf::init_type::type type, unsigned int darwin_iter = 0,
+        bool darwin_gamma_corr = false ) {
 
         if ( iter != 0 ) {
             ABORT( "Simulation::init_fields() may only be called at iter = 0" );
@@ -146,8 +149,14 @@ class Simulation {
                 // the transverse-field shifted Helmholtz solve). darwin_wp2()
                 // uses the physical 1/m_q (not the macroparticle charge), so it
                 // is correct for the < 1ppc (Sparse / Lattice) case as well.
+                // With darwin_gamma_corr it also carries the relativistic
+                // < 1/gamma > factor of the velocity response (convergence rate
+                // only; the converged Darwin solution is independent of wp2).
                 double wp2 = 0;
-                for ( auto & sp : species ) wp2 += sp -> darwin_wp2();
+                for ( auto & sp : species ) wp2 += sp -> darwin_wp2( darwin_gamma_corr );
+
+                std::cout << "(*info*) Darwin init wp2 = " << wp2
+                          << ( darwin_gamma_corr ? " (<1/gamma> corrected)" : " (uncorrected)" ) << '\n';
 
                 // Temporary Darwin moment grids (used for init-only).
                 // They reuse current.J's guard-cell layout and FFT plans

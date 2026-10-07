@@ -1393,6 +1393,78 @@ void Species::deposit_darwin_retarded_current( vec3grid<float3> * const J ) cons
 }
 
 namespace kernel {
+
+__global__
+/**
+ * @brief Accumulate the particle average of 1/gamma
+ *
+ * Each term is normalized by the total particle count before being summed, so the
+ * accumulator stays O(1) regardless of the number of particles.
+ *
+ * @param part      Particle data
+ * @param norm      1 / (total number of particles)
+ * @param d_avg     [out] accumulated < 1/gamma >
+ */
+void mean_rgamma( ParticleData const part, double const norm,
+    double * const __restrict__ d_avg )
+{
+    const int2 tile_idx = make_int2( blockIdx.x, blockIdx.y );
+    const int tile_id   = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const int p_offset = part.offset[ tile_id ];
+    const int np       = part.np[ tile_id ];
+    float3 const * __restrict__ const u = &part.u[ p_offset ];
+
+    double sum = 0;
+    for( int i = block_thread_rank(); i < np; i += block_num_threads() )
+        sum += double( rgamma( u[i] ) ) * norm;
+
+    sum = warp::reduce_add( sum );
+    if ( warp::thread_rank() == 0 ) device::atomic_fetch_add( d_avg, sum );
+}
+
+}
+
+/**
+ * @brief Particle average of the inverse Lorentz factor, < 1/gamma >
+ *
+ * @return double   < 1/gamma > (1 for a cold species, < 1 otherwise)
+ */
+double Species::mean_rgamma() const
+{
+    auto np = particles -> np_total();
+    if ( np == 0 ) return 1.0;
+
+    double * d_avg = device::malloc<double>( 1 );
+    device::zero( d_avg, 1 );
+
+    dim3 grid( particles -> ntiles.x, particles -> ntiles.y );
+    auto block = 64;
+    kernel::mean_rgamma <<< grid, block >>> ( *particles, 1.0 / np, d_avg );
+
+    double avg;
+    device::memcpy_tohost( &avg, d_avg, 1 );
+    device::free( d_avg );
+
+    return avg;
+}
+
+/**
+ * @brief Per-species contribution to the background plasma frequency squared
+ *
+ * See the declaration in species.h for the rationale.
+ *
+ * @param gamma_corr    Include the relativistic < 1/gamma > correction
+ * @return double
+ */
+double Species::darwin_wp2( bool gamma_corr ) const
+{
+    double wp2 = density->n0 / std::fabs( double(m_q) );
+    if ( gamma_corr ) wp2 *= mean_rgamma();
+    return wp2;
+}
+
+namespace kernel {
 __global__
 /**
  * @brief Accumulate the boosted-Coulomb field of every particle in k-space
@@ -1565,7 +1637,7 @@ void deposit_charge(
         const int ix_offset = spline_s4( x[i].x, sx );
         const int iy_offset = spline_s4( x[i].y, sy );
 
-        const int idx = ( ix[i].x + iy_offset ) + ( ix[i].y + ix_offset ) * ystride;
+        const int idx = ( ix[i].x + ix_offset ) + ( ix[i].y + iy_offset ) * ystride;
 
         for ( int jj = -2; jj < 3; jj++ ) {
             for ( int ii = -2; ii < 3; ii++ ) {
