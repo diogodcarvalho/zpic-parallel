@@ -12,8 +12,9 @@ namespace bseed {
  * of a quiet (mirror / antithetic, J = 0) Maxwell-Juttner start at their stationary
  * level, so they do not have to grow from B = 0 at the slow rate Gamma_k ~ k^3.
  *
- * Every mode 0 < |k| < kmax gets an independent Gaussian B (both polarizations),
- * carried by a smooth momentum kick of the particles chosen so that the filtered
+ * Every mode 0 < |k| < kmax gets an independent random B (both polarizations; Gaussian,
+ * or fixed amplitude with a random phase), sized so that its slow part sits at the
+ * stationary level, carried by a smooth momentum kick of the particles chosen so that the filtered
  * current balances it ( F J = curl B, E_T = 0 ), which leaves the undamped light waves
  * unexcited to second order. Mirror pairs get identical kicks. B is written to the
  * EMF; init=darwin rebuilds the same B from the kicked current.
@@ -28,9 +29,11 @@ namespace bseed {
  * @param ppc       Number of particles per cell
  * @param kmax      Largest seeded |k| [omega_p / c] (0 = Omega / sqrt(3), light share 1/4)
  * @param seed      RNG seed offset
+ * @param fixed     Fixed-amplitude seed (same mean, no draw-to-draw scatter of the
+ *                  slow modes, which keep their t = 0 draw for the whole run)
  */
 void kick( Simulation & sim, Species & species, float const theta, float const n0,
-    uint2 const ppc, float kmax, unsigned int const seed );
+    uint2 const ppc, float kmax, unsigned int const seed, bool const fixed );
 
 }
 

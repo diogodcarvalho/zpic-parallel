@@ -11,22 +11,31 @@
  * where P = F S^2 w_p^2 and g_perp the transverse MJ marginal in w = v_par / v_th
  * units. A quiet start (J = 0, so B = 0) has to grow them at this ~k^3 rate. Expanding
  * Pi to second order in Gamma / kappa (the MJ identity g_perp' = -w g_par makes the
- * quadratic coefficient exactly P), the pole and its share of the stationary B
- * variance (FDT residue) are
+ * quadratic coefficient exactly P), the pole and its residue are
  *
  *      b Gamma^2 + a Gamma - k^2 = 0,  b = P / kappa^2 - 1,   A_inf = k^2 / ( k^2 + b Gamma^2 )
  *
- * so the stationary slow-mode variance is F A_inf per polarization, in units of the
- * per-mode thermal level theta n0 |m_q| / ppc (unnormalized FFT, per grid cell).
+ * From B = 0 the particle noise refills a slow mode as F ( 1 - R_L ) ( 1 - exp(-2 Gamma t) ),
+ * where F ( 1 - R_L ) is the stationary (damped) level per polarization, in units of the
+ * per-mode thermal level theta n0 |m_q| / ppc (unnormalized FFT, per grid cell), and R_L
+ * the light-wave share of the transverse sum rule. A seed whose slow part decays as
+ * sigma A_s exp(-Gamma t) thus keeps the spectrum stationary for sigma^2 A_s^2 = F ( 1 - R_L ).
+ * (The residue F A_inf is larger than F ( 1 - R_L ); it is not the slow-mode variance.)
  *
- * The seed is an independent Gaussian B_0 (both polarizations) carried by a smooth
+ * The seed is an independent random B_0 (both polarizations) carried by a smooth
  * momentum kick. A kick du is an impulsive field, so choosing the deposited, filtered
  * current to balance B_0 ( F J = i k x B_0, E_T = 0 ) cancels the light-wave pole to
  * second order. The kicked state then puts A_s = A_inf ( 1 + ( k^2 + Gamma^2 ) / Pi_inf )
- * of B_0 into the slow mode ( Pi_inf = P m0, m0 = Omega^2 / w_p^2 ), and the start is
- * stationary for sigma^2 A_s^2 = F A_inf, i.e.
+ * of B_0 into the slow mode ( Pi_inf = P m0, m0 = Omega^2 / w_p^2 ), so
  *
- *      sigma^2 = F / ( A_inf ( 1 + ( k^2 + Gamma^2 ) / Pi_inf )^2 )
+ *      sigma^2 = F ( 1 - R_L ) / A_s^2
+ *
+ * R_L = 2 k^2 / ( w_L dD/dw ) at the light pole of D = w^2 - k^2 - Pi, with the
+ * non-resonant ( w > k c ) series Pi = P sum_n m_n ( k / w )^(2n), m_n = < v_y^2 v_x^(2n) > / theta.
+ *
+ * The slow modes keep their t = 0 draw for longer than a run, so a Gaussian draw leaves
+ * a shell of N modes off by ~1/sqrt(N) for the whole run; the fixed-amplitude seed
+ * ( |xi| = sigma, random phase ) has the same mean and removes that scatter.
  *
  * The current of a smooth kick is rho0 lambda S^2 du, with lambda = < (1 - v_i^2)/gamma >
  * measured from the particles (one S from interpolating du, one from the deposit).
@@ -83,6 +92,58 @@ void mj_perp( double const theta, double & g0, double & m0 ) {
 }
 
 /**
+ * @brief Moments m_n = < v_y^2 v_x^(2n) > / theta, n = 0..3, of an isotropic 3D
+ *        Maxwell-Juttner distribution ( m_0 = Omega^2 / w_p^2 )
+ *
+ * With p = sinh eta the speed distribution is sinh^2 eta cosh eta exp( -(gamma-1)/theta ) d eta,
+ * and the angular average of v_y^2 v_x^(2n) is v^(2n+2) / ( (2n+1)(2n+3) ).
+ *
+ * @param theta     MJ temperature
+ * @param m         [out] m_0 .. m_3
+ */
+void mj_moments( double const theta, double m[4] ) {
+    const int n = 4000;
+    const double eta_max = std::acosh( 1 + 40 * theta );
+    const double deta = eta_max / n;
+
+    double Z = 0, s[4] = {0, 0, 0, 0};
+    for( int j = 0; j < n; j++ ) {
+        const double eta = ( j + 0.5 ) * deta;
+        const double g   = std::cosh( eta );
+        const double v2  = std::tanh( eta ) * std::tanh( eta );
+        const double w   = std::sinh( eta ) * std::sinh( eta ) * g * std::exp( -( g - 1 ) / theta );
+        Z += w;
+        double vn = v2;
+        for( int i = 0; i < 4; i++ ) { s[i] += w * vn; vn *= v2; }
+    }
+    for( int i = 0; i < 4; i++ ) m[i] = s[i] / Z / ( ( 2 * i + 1 ) * ( 2 * i + 3 ) ) / theta;
+}
+
+/**
+ * @brief Light-wave share R_L of the transverse sum rule of one mode
+ *
+ * Newton on x = w_L^2 for D = x - k^2 - P sum_n m_n ( k^2 / x )^n, then
+ * R_L = 2 k^2 / ( w_L dD/dw ) = k^2 / ( x + P sum_n n m_n ( k^2 / x )^n ).
+ *
+ * @param k2        |k|^2
+ * @param P         F S^2 w_p^2
+ * @param m         m_0 .. m_3 (see mj_moments)
+ * @return          R_L
+ */
+__host__ __device__ inline
+float light_share( float const k2, float const P, float4 const m ) {
+    float x = k2 + P * m.x;
+    for( int i = 0; i < 6; i++ ) {
+        const float s = k2 / x;
+        const float f = x - k2 - P * ( m.x + s * ( m.y + s * ( m.z + s * m.w ) ) );
+        const float d = 1 + P * s * ( m.y + s * ( 2 * m.z + s * 3 * m.w ) ) / x;
+        x -= f / d;
+    }
+    const float s = k2 / x;
+    return k2 / ( x + P * s * ( m.y + s * ( 2 * m.z + s * 3 * m.w ) ) );
+}
+
+/**
  * @brief Relaxation rate Gamma_k and slow share A_inf of one mode (see file header)
  *
  * @param k2        |k|^2
@@ -119,22 +180,23 @@ __global__
  * @param kmax      Largest seeded |k|
  * @param wp2       Plasma frequency squared
  * @param theta     MJ temperature
- * @param m0        Omega^2 / w_p^2 = int g_perp dw
+ * @param mom       MJ moments m_0 .. m_3 ( m_0 = Omega^2 / w_p^2 = int g_perp dw )
  * @param g0        g_perp(0)
  * @param amp0      Per-mode thermal level theta n0 |m_q| / ppc
  * @param ncells    Number of grid cells ( <|xi|^2> of the unnormalized FFT )
  * @param rho0      Species charge density
  * @param lambda    Kick response < (1 - v^2)/gamma >, ( in-plane, z )
  * @param rnd_seed  RNG seed
+ * @param fixed     Fixed-amplitude seed ( |xi| = sigma, random phase ) instead of Gaussian
  */
 void bseed_fields(
     fft::complex64 * const __restrict__ d_fB,
     fft::complex64 * const __restrict__ d_fdu,
     fft::complex64 const * const __restrict__ d_fF,
     uint2 const dims, float2 const dk, float2 const dx,
-    float const kmax, float const wp2, float const theta, float const m0, float const g0,
+    float const kmax, float const wp2, float const theta, float4 const mom, float const g0,
     float const amp0, float const ncells, float const rho0, float2 const lambda,
-    uint2 const rnd_seed )
+    uint2 const rnd_seed, bool const fixed )
 {
     const int vol = dims.x * dims.y;
 
@@ -179,22 +241,33 @@ void bseed_fields(
             if ( F > 0 ) {
                 // Slow pole and stationary seed variance (see file header)
                 const float P    = F * S * S * wp2;
-                const float Pinf = P * m0;
+                const float Pinf = P * mom.x;
                 float Gamma, A;
                 slow_mode( k2, P, theta, g0, Gamma, A );
                 const float r     = 1 + ( k2 + Gamma * Gamma ) / Pinf;
-                const float sigma = sqrtf( amp0 * F / ( A * r * r ) );
+                const float RL    = light_share( k2, P, mom );
+                const float sigma = sqrtf( amp0 * F * ( 1 - RL ) ) / ( A * r );
 
-                // Two independent complex Gaussians, < |xi|^2 > = ncells
+                // Two independent complex amplitudes, < |xi|^2 > = ncells sigma^2: Gaussian,
+                // or fixed modulus with a random phase
                 uint2 state; double norm;
                 zrandom::rand_init( iyr * stride + ix, rnd_seed, state, norm );
-                const float s  = sqrtf( 0.5f * ncells ) * sigma;
-                const float n1 = zrandom::rand_norm( state, norm );
-                const float n2 = zrandom::rand_norm( state, norm );
-                const float n3 = zrandom::rand_norm( state, norm );
-                const float n4 = zrandom::rand_norm( state, norm );
-                const fft::complex64 xi1( s * n1, s * n2 );
-                const fft::complex64 xi2( s * n3, s * n4 );
+                fft::complex64 xi1 = 0, xi2 = 0;
+                if ( fixed ) {
+                    const float s  = sqrtf( ncells ) * sigma;
+                    const float p1 = 6.28318531f * zrandom::rand_real2( state );
+                    const float p2 = 6.28318531f * zrandom::rand_real2( state );
+                    xi1 = fft::complex64( s * cosf( p1 ), s * sinf( p1 ) );
+                    xi2 = fft::complex64( s * cosf( p2 ), s * sinf( p2 ) );
+                } else {
+                    const float s  = sqrtf( 0.5f * ncells ) * sigma;
+                    const float n1 = zrandom::rand_norm( state, norm );
+                    const float n2 = zrandom::rand_norm( state, norm );
+                    const float n3 = zrandom::rand_norm( state, norm );
+                    const float n4 = zrandom::rand_norm( state, norm );
+                    xi1 = fft::complex64( s * n1, s * n2 );
+                    xi2 = fft::complex64( s * n3, s * n4 );
+                }
 
                 // B_z (in-plane J_T) and in-plane B = xi2 ( z x khat ) (J_z)
                 const float rk = rsqrtf( k2 );
@@ -232,14 +305,16 @@ void bseed_fields(
 }
 
 void bseed::kick( Simulation & sim, Species & species, float const theta, float const n0,
-    uint2 const ppc, float kmax, unsigned int const seed ) {
+    uint2 const ppc, float kmax, unsigned int const seed, bool const fixed ) {
 
     // Kick response of the actual load, and the analytic MJ constants
     double3 lambda; double T;
     species.kick_response( lambda, T );
 
-    double g0, m0;
+    double g0, m0, m[4];
     mj_perp( theta, g0, m0 );
+    mj_moments( theta, m );
+    const float4 mom = make_float4( m0, m[1], m[2], m[3] );
 
     const double wp2    = n0 / std::fabs( species.m_q );
     const double Omega2 = wp2 * m0;
@@ -277,8 +352,8 @@ void bseed::kick( Simulation & sim, Species & species, float const theta, float 
         reinterpret_cast<fft::complex64 *>( sim.emf.fB -> d_buffer ),
         reinterpret_cast<fft::complex64 *>( fdu.d_buffer ),
         reinterpret_cast<fft::complex64 *>( fF.d_buffer ),
-        fdims, fft::dk( sim.box ), dx, kmax, wp2, theta, m0, g0,
-        amp0, float( dims.x ) * dims.y, rho0, lam, rnd_seed
+        fdims, fft::dk( sim.box ), dx, kmax, wp2, theta, mom, g0,
+        amp0, float( dims.x ) * dims.y, rho0, lam, rnd_seed, fixed
     );
 
     sim.emf.fft_backward -> transform( *sim.emf.fB, *sim.emf.B );
@@ -312,8 +387,10 @@ void bseed::kick( Simulation & sim, Species & species, float const theta, float 
     sim.emf.get_energy( ene_E, ene_B );
 
     std::cout << "(*info*) Magnetic-silent start: kmax = " << kmax << " (k lambda_D = " << kmax * lambda_D
-              << "), " << nmodes / 2 << " independent modes seeded, 1/(2 Gamma) = "
-              << 0.5 / G_box << " (box mode) to " << 0.5 / G_max << " (kmax)\n";
+              << "), " << nmodes / 2 << " independent modes seeded ("
+              << ( fixed ? "fixed amplitude" : "Gaussian" ) << "), 1/(2 Gamma) = "
+              << 0.5 / G_box << " (box mode) to " << 0.5 / G_max << " (kmax), R_L(kmax) = "
+              << light_share( kmax * kmax, wp2, mom ) << '\n';
     std::cout << "(*info*) Magnetic-silent start: max |du| = " << max << " ("
               << max / std::sqrt( 3 * T ) << " of sqrt(3T)), seeded B energy = "
               << ene_B.x + ene_B.y + ene_B.z << '\n';
