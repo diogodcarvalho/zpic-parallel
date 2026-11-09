@@ -16,6 +16,7 @@
 #include "fft.h"
 #include "simulation.h"
 #include "silent.h"
+#include "bseed.h"
 
 namespace kernel {
 
@@ -474,6 +475,8 @@ void test_sparse( std::string param ) {
     uint2  corr_group{ 0, 0 };           // antithetic pair sub-area, in cells (maxwell_juttner_corr_group only)
     uint  mirror  = 0;                   // load ppc/2 lattice sites, each with a ( u, -u ) pair at the same position (J = 0 at t=0)
     uint  silent  = 0;                   // displace the mirror pairs so no undamped Langmuir mode is excited at t=0 (needs mirror=1, udist=maxwell_juttner)
+    uint  bseed   = 0;                   // seed the overdamped low-k B modes at their stationary level via a current-balanced momentum kick (needs a quiet load, udist=maxwell_juttner*)
+    float bseed_kmax = 0.0f;             // largest seeded |k| in w_p/c (bseed=1 only; 0 = Omega/sqrt(3), light-wave share 1/4)
     uint  ions    = 0;                   // add mobile ions (charge +1) with the electron density profile and temperature
     float m_ion   = 1.0f;                // ion mass in electron masses (ions=1 only; 1 = positrons)
     std::string filter_mode = "lowpass"; // source filter: none | lowpass | binomial | gaussian
@@ -516,6 +519,8 @@ void test_sparse( std::string param ) {
                                           if ( got == 1 ) { corr_group.y = corr_group.x; got = 2; }              want = 2; }
         else if ( key == "mirror"     ) { got = std::sscanf( val.c_str(), "%u",       &mirror );                want = 1; }
         else if ( key == "silent"     ) { got = std::sscanf( val.c_str(), "%u",       &silent );                want = 1; }
+        else if ( key == "bseed"      ) { got = std::sscanf( val.c_str(), "%u",       &bseed );                 want = 1; }
+        else if ( key == "bseed_kmax" ) { got = std::sscanf( val.c_str(), "%f",       &bseed_kmax );            want = 1; }
         else if ( key == "ions"       ) { got = std::sscanf( val.c_str(), "%u",       &ions );                  want = 1; }
         else if ( key == "m_ion"      ) { got = std::sscanf( val.c_str(), "%f",       &m_ion );                 want = 1; }
         else if ( key == "n_dump"     ) { got = std::sscanf( val.c_str(), "%u",       &n_dump );                want = 1; }
@@ -586,6 +591,8 @@ void test_sparse( std::string param ) {
         std::cout << "corr_group: " << corr_group << " cells (antithetic pair sub-area)\n";
     std::cout << "mirror    : " << mirror  << ( mirror ? " (( u, -u ) pairs at the same position)" : "" ) << '\n';
     std::cout << "silent    : " << silent  << ( silent ? " (Langmuir-silent displacement of the mirror pairs)" : "" ) << '\n';
+    std::cout << "bseed     : " << bseed   << ( bseed ? " (magnetic-silent start, kmax=" +
+                                                 ( bseed_kmax > 0 ? std::to_string(bseed_kmax) : std::string("auto") ) + ")" : "" ) << '\n';
     std::cout << "ions      : " << ions    << ( ions ? " (m_ion=" + std::to_string(m_ion) + ")" : "" ) << '\n';
     std::cout << "uth       : " << uth     << '\n';
     std::cout << "ufl       : " << ufl     << '\n';
@@ -694,6 +701,31 @@ void test_sparse( std::string param ) {
             std::exit(1);
         }
     }
+    if ( bseed ) {
+        // The seed level and relaxation rate use the MJ transverse marginal
+        if ( udist.rfind( "maxwell_juttner", 0 ) != 0 ) {
+            std::cerr << "bseed=1 requires udist=maxwell_juttner*\n";
+            std::exit(1);
+        }
+        // On a random load the (unscreened) Darwin B of the particle current is
+        // already above the target, so the seed only makes sense on a J = 0 load
+        if ( ! mirror && udist == "maxwell_juttner" ) {
+            std::cerr << "bseed=1 requires a quiet current load (mirror=1 or "
+                      << "udist=maxwell_juttner_corr*)\n";
+            std::exit(1);
+        }
+        // init=none would leave E inconsistent with the charge; poisson keeps the
+        // seeded B, darwin rebuilds the same B from the kicked current
+        if ( init_type != emf::init_type::poisson && init_type != emf::init_type::darwin ) {
+            std::cerr << "bseed=1 requires init=poisson or init=darwin\n";
+            std::exit(1);
+        }
+        // bseed::kick only knows about the electrons
+        if ( ions ) {
+            std::cerr << "bseed=1 is not supported with ions=1\n";
+            std::exit(1);
+        }
+    }
 
     if ( udist == "maxwell_juttner" )
         electrons.set_udist(
@@ -766,6 +798,9 @@ void test_sparse( std::string param ) {
 
     // Langmuir-silent start: must follow the injection and precede the field init
     if ( silent ) silent::displace( sim, electrons, theta, density, ppc );
+
+    // Magnetic-silent start: after the displacement (positions final), before the field init
+    if ( bseed ) bseed::kick( sim, electrons, theta, density, ppc, bseed_kmax, seed );
 
     // Initialize fields, must be done before first advance()
     sim.init_fields( init_type, darwin_iter, darwin_gamma_corr != 0 );

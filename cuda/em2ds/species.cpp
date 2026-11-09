@@ -1607,6 +1607,156 @@ namespace kernel {
 
 __global__
 /**
+ * @brief Kernel to kick particle momenta by a grid momentum field
+ *
+ * @param part          Particle data
+ * @param du_buffer     Momentum kick field buffer (u = p / m c units)
+ * @param du_offset     Offset to cell (0,0) in the field tile
+ * @param du_ext_nx     Field tile size (includes guard cells)
+ * @param d_max         [out] maximum |du| component (float bits)
+ */
+void kick(
+    ParticleData part,
+    float3 const * const __restrict__ du_buffer,
+    int const du_offset, uint2 const du_ext_nx,
+    unsigned int * const __restrict__ d_max )
+{
+    const int2 tile_idx = make_int2( blockIdx.x, blockIdx.y );
+    const int tile_id   = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const int ystride   = du_ext_nx.x;
+    const auto tile_vol = roundup4( du_ext_nx.x * du_ext_nx.y );
+
+    float3 const * const __restrict__ du = & du_buffer[ tile_id * tile_vol + du_offset ];
+
+    const int p_offset = part.offset[ tile_id ];
+    const int np       = part.np[ tile_id ];
+    int2   const * __restrict__ ix = &part.ix[ p_offset ];
+    float2 const * __restrict__ x  = &part.x[ p_offset ];
+    float3 * __restrict__ u        = &part.u[ p_offset ];
+
+    float dmax = 0;
+
+    for( int i = block_thread_rank(); i < np; i += block_num_threads() ) {
+
+        // Interpolate the kick with the field push weights (2nd output unused)
+        float3 d, unused;
+        interpolate_fld( du, du, ystride, ix[i], x[i], d, unused );
+
+        dmax = fmaxf( dmax, fmaxf( fabsf( d.x ), fmaxf( fabsf( d.y ), fabsf( d.z ) ) ) );
+
+        float3 pu = u[i];
+        pu.x += d.x;
+        pu.y += d.y;
+        pu.z += d.z;
+        u[i] = pu;
+    }
+
+    // Positive floats are ordered like their bit patterns
+    device::atomic_fetch_max( d_max, __float_as_uint( dmax ) );
+}
+
+__global__
+/**
+ * @brief Accumulate the kick response < (1 - v_i^2)/gamma > and < u.v >
+ *
+ * Each term is normalized by the total particle count before being summed, so the
+ * accumulators stay O(1) regardless of the number of particles.
+ *
+ * @param part      Particle data
+ * @param norm      1 / (total number of particles)
+ * @param d_avg     [out] accumulated ( lambda_x, lambda_y, lambda_z, < u.v > )
+ */
+void kick_response( ParticleData const part, double const norm,
+    double * const __restrict__ d_avg )
+{
+    const int2 tile_idx = make_int2( blockIdx.x, blockIdx.y );
+    const int tile_id   = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const int p_offset = part.offset[ tile_id ];
+    const int np       = part.np[ tile_id ];
+    float3 const * __restrict__ const u = &part.u[ p_offset ];
+
+    double sum[4] = { 0, 0, 0, 0 };
+    for( int i = block_thread_rank(); i < np; i += block_num_threads() ) {
+        float3 const pu = u[i];
+        double const rg = rgamma( pu );
+        double const vx = pu.x * rg;
+        double const vy = pu.y * rg;
+        double const vz = pu.z * rg;
+
+        sum[0] += ( 1 - vx * vx ) * rg * norm;
+        sum[1] += ( 1 - vy * vy ) * rg * norm;
+        sum[2] += ( 1 - vz * vz ) * rg * norm;
+        sum[3] += ( pu.x * vx + pu.y * vy + pu.z * vz ) * norm;
+    }
+
+    for( int j = 0; j < 4; j++ ) {
+        double const s = warp::reduce_add( sum[j] );
+        if ( warp::thread_rank() == 0 ) device::atomic_fetch_add( & d_avg[j], s );
+    }
+}
+
+}
+
+/**
+ * @brief Kick all particle momenta by a grid momentum field
+ *
+ * @param du        Momentum kick field (u = p / m c units)
+ * @return float    Maximum |du| component
+ */
+float Species::kick( vec3grid<float3> const & du )
+{
+    device::Var<unsigned int> d_max( 0 );
+
+    dim3 grid( particles -> ntiles.x, particles -> ntiles.y );
+    auto block = 1024;
+
+    kernel::kick <<< grid, block >>> (
+        *particles, du.d_buffer, du.offset, du.ext_nx, d_max.ptr()
+    );
+
+    unsigned int const bits = d_max.get();
+    float max;
+    std::memcpy( &max, &bits, sizeof( float ) );
+
+    return max;
+}
+
+/**
+ * @brief Particle averages that set the current response to a momentum kick
+ *
+ * @param lambda    [out] < ( 1 - v_i^2 ) / gamma >, i = x, y, z
+ * @param T         [out] < u.v > / 3
+ */
+void Species::kick_response( double3 & lambda, double & T ) const
+{
+    auto np = particles -> np_total();
+    if ( np == 0 ) {
+        lambda = make_double3( 1, 1, 1 );
+        T = 0;
+        return;
+    }
+
+    double * d_avg = device::malloc<double>( 4 );
+    device::zero( d_avg, 4 );
+
+    dim3 grid( particles -> ntiles.x, particles -> ntiles.y );
+    auto block = 64;
+    kernel::kick_response <<< grid, block >>> ( *particles, 1.0 / np, d_avg );
+
+    double avg[4];
+    device::memcpy_tohost( avg, d_avg, 4 );
+    device::free( d_avg );
+
+    lambda = make_double3( avg[0], avg[1], avg[2] );
+    T = avg[3] / 3;
+}
+
+namespace kernel {
+
+__global__
+/**
  * @brief Accumulate the particle average of 1/gamma
  *
  * Each term is normalized by the total particle count before being summed, so the

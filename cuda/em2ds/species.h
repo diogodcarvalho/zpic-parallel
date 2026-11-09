@@ -428,6 +428,31 @@ public:
     float displace( vec3grid<float3> const & xi );
 
     /**
+     * @brief Kick the momenta of all particles by a grid momentum field
+     *
+     * The field (in units of u = p / m c) is interpolated at the particle position
+     * with the same quartic weights used by the field push, so particles at the same
+     * position (e.g. mirror pairs) get bitwise identical kicks. Positions are not
+     * changed, so no re-sort is needed.
+     *
+     * @param du        Momentum kick field (guard cells must be up to date)
+     * @return float    Maximum |du| component
+     */
+    float kick( vec3grid<float3> const & du );
+
+    /**
+     * @brief Particle averages that set the current response to a momentum kick
+     *
+     * A kick du changes the velocity by (1/gamma)( 1 - v v ) du, so the current of a
+     * smooth kick is q n0 lambda du, with lambda_i = < ( 1 - v_i^2 ) / gamma >. Also
+     * returns the kinetic temperature T = < u.v > / 3 (= theta for Maxwell-Juttner).
+     *
+     * @param lambda    [out] ( < (1 - vx^2)/gamma >, < (1 - vy^2)/gamma >, < (1 - vz^2)/gamma > )
+     * @param T         [out] < u.v > / 3
+     */
+    void kick_response( double3 & lambda, double & T ) const;
+
+    /**
      * @brief Accumulate this species' contribution to the boosted-Coulomb field init
      *
      * Adds, in k-space, the exact frozen field of every macroparticle treated as a
