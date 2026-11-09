@@ -15,6 +15,7 @@
 
 #include "fft.h"
 #include "simulation.h"
+#include "silent.h"
 
 namespace kernel {
 
@@ -472,6 +473,9 @@ void test_sparse( std::string param ) {
     float theta   = 0.0f;                // normalized temperature kT/mc^2 (maxwell_juttner only)
     uint2  corr_group{ 0, 0 };           // antithetic pair sub-area, in cells (maxwell_juttner_corr_group only)
     uint  mirror  = 0;                   // load ppc/2 lattice sites, each with a ( u, -u ) pair at the same position (J = 0 at t=0)
+    uint  silent  = 0;                   // displace the mirror pairs so no undamped Langmuir mode is excited at t=0 (needs mirror=1, udist=maxwell_juttner)
+    uint  ions    = 0;                   // add mobile ions (charge +1) with the electron density profile and temperature
+    float m_ion   = 1.0f;                // ion mass in electron masses (ions=1 only; 1 = positrons)
     std::string filter_mode = "lowpass"; // source filter: none | lowpass | binomial | gaussian
     unsigned filter_order = 1;           // binomial filter order (binomial only)
     unsigned filter_comp = 0;            // binomial compensator order (binomial only; 0 = no compensator)
@@ -511,6 +515,9 @@ void test_sparse( std::string param ) {
         else if ( key == "corr_group" ) { got = std::sscanf( val.c_str(), "%u,%u",    &corr_group.x, &corr_group.y );
                                           if ( got == 1 ) { corr_group.y = corr_group.x; got = 2; }              want = 2; }
         else if ( key == "mirror"     ) { got = std::sscanf( val.c_str(), "%u",       &mirror );                want = 1; }
+        else if ( key == "silent"     ) { got = std::sscanf( val.c_str(), "%u",       &silent );                want = 1; }
+        else if ( key == "ions"       ) { got = std::sscanf( val.c_str(), "%u",       &ions );                  want = 1; }
+        else if ( key == "m_ion"      ) { got = std::sscanf( val.c_str(), "%f",       &m_ion );                 want = 1; }
         else if ( key == "n_dump"     ) { got = std::sscanf( val.c_str(), "%u",       &n_dump );                want = 1; }
         else if ( key == "n_skip"     ) { got = std::sscanf( val.c_str(), "%u",       &n_skip );                want = 1; }
         else if ( key == "tmax"       ) { got = std::sscanf( val.c_str(), "%f",       &tmax );                  want = 1; }
@@ -578,6 +585,8 @@ void test_sparse( std::string param ) {
     if ( udist == "maxwell_juttner_corr_group" )
         std::cout << "corr_group: " << corr_group << " cells (antithetic pair sub-area)\n";
     std::cout << "mirror    : " << mirror  << ( mirror ? " (( u, -u ) pairs at the same position)" : "" ) << '\n';
+    std::cout << "silent    : " << silent  << ( silent ? " (Langmuir-silent displacement of the mirror pairs)" : "" ) << '\n';
+    std::cout << "ions      : " << ions    << ( ions ? " (m_ion=" + std::to_string(m_ion) + ")" : "" ) << '\n';
     std::cout << "uth       : " << uth     << '\n';
     std::cout << "ufl       : " << ufl     << '\n';
     std::cout << "filter    : " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) +
@@ -666,6 +675,25 @@ void test_sparse( std::string param ) {
                       << "cancelled\n";
     }
     electrons.mirror = ( mirror != 0 );
+    if ( silent ) {
+        // The displacement cancels only the part of the Langmuir projection even in v
+        // (the pairs cancel the odd part), and uses the MJ dispersion relation
+        if ( ! mirror || udist != "maxwell_juttner" ) {
+            std::cerr << "silent=1 requires mirror=1 and udist=maxwell_juttner\n";
+            std::exit(1);
+        }
+        // The displaced charge is no longer uniform, so E must be rebuilt from it
+        if ( init_type == emf::init_type::none ) {
+            std::cerr << "silent=1 requires an init that solves for E from the charge "
+                      << "(e.g. init=poisson)\n";
+            std::exit(1);
+        }
+        // silent::displace only knows about the electrons
+        if ( ions ) {
+            std::cerr << "silent=1 is not supported with ions=1\n";
+            std::exit(1);
+        }
+    }
 
     if ( udist == "maxwell_juttner" )
         electrons.set_udist(
@@ -703,6 +731,42 @@ void test_sparse( std::string param ) {
 
     sim.add_species( electrons );
 
+    // Mobile ions (charge +1, mass m_ion; m_ion = 1 gives positrons) with the
+    // electron density profile. u = p / (m c), so theta and uth are scaled by the
+    // mass to load the ions at the electron temperature. The species id offsets
+    // the udist seed, so their momenta are independent of the electrons'. Only
+    // constructed when used: ~Species frees np_inj, which is left uninitialized
+    // until the species is added to a simulation.
+    std::unique_ptr<Species> ion;
+    if ( ions ) {
+        // m_q sign sets the charge sign, so the mass must be positive
+        if ( m_ion <= 0 ) {
+            std::cerr << "m_ion must be positive\n";
+            std::exit(1);
+        }
+        ion.reset( new Species( "ions", m_ion, ppc, true ) );
+        ion -> set_density( electrons.get_density() );
+
+        float  const theta_i = theta / m_ion;
+        float  const s       = 1.0f / std::sqrt( m_ion );
+        float3 const uth_i   = make_float3( uth.x * s, uth.y * s, uth.z * s );
+        if ( udist == "maxwell_juttner" )
+            ion -> set_udist( UDistribution::MaxwellJuttner( theta_i ) );
+        else if ( udist == "maxwell_juttner_corr" )
+            ion -> set_udist( UDistribution::MaxwellJuttnerCorr( theta_i, ppc ) );
+        else if ( udist == "maxwell_juttner_corr_group" )
+            ion -> set_udist( UDistribution::MaxwellJuttnerCorrGroup( theta_i, corr_group ) );
+        else
+            ion -> set_udist( UDistribution::ThermalCorr( uth_i, ufl ) );
+
+        ion -> mirror = electrons.mirror;
+        ion -> seed = seed;
+        sim.add_species( *ion );
+    }
+
+    // Langmuir-silent start: must follow the injection and precede the field init
+    if ( silent ) silent::displace( sim, electrons, theta, density, ppc );
+
     // Initialize fields, must be done before first advance()
     sim.init_fields( init_type, darwin_iter, darwin_gamma_corr != 0 );
 
@@ -727,11 +791,14 @@ void test_sparse( std::string param ) {
 
                     sim.charge.save();
                     electrons.save_charge();
+                    if ( ion ) ion -> save_charge();
                 }
             }
 
-            if ( save_part )
+            if ( save_part ) {
                 electrons.save();
+                if ( ion ) ion -> save();
+            }
         }
         sim.energy_info();
     };
@@ -820,9 +887,12 @@ void cli_help( char * argv0 ) {
  * three-body configuration in the box (default: equilateral triangle, side 16).
  *
  * Params (key=value): ntiles, nx, dx, dt, tmax, n_dump, n_skip, save_part,
+ *   n_dump_part (particle dump interval, defaults to n_dump),
  *   p1="x,y", p2="x,y", p3="x,y" (positions, sim units),
  *   u1="ux,uy,uz", u2="ux,uy,uz", u3="ux,uy,uz" (proper momentum u=gamma*beta),
  *   s1, s2, s3 (charge signs, +1/-1), q (charge magnitude),
+ *   q2 (charge magnitude of particle 2, defaults to q; 0 gives a neutral particle),
+ *   m2 (|m_q| of particle 2, defaults to 1; e.g. a heavy ion),
  *   init (poisson|darwin|boosted|none), filter (none|lowpass|binomial|gaussian),
  *   filter_order, filter_comp (binomial), filter_sigma (gaussian).
  *   The p3/u3/s3 keys are ignored unless npart = 3.
@@ -840,6 +910,7 @@ void test_boosted_pair( std::string param, unsigned npart = 2 ) {
     uint   n_dump = 100;
     uint   n_skip = 0;
     uint   save_part = 1;
+    uint   n_dump_part = 0;          // particle dump interval (0: same as n_dump)
 
     // Two particles: positions (sim units), velocities (u = gamma*beta), charge signs
     float2 p1 { 64.0f, 56.0f };
@@ -848,6 +919,8 @@ void test_boosted_pair( std::string param, unsigned npart = 2 ) {
     float3 u2 { 0.0f, 0.0f, 0.0f };
     float  s1 = -1.0f, s2 = -1.0f;   // charge signs (mass/charge sign)
     float  q  = 1.0f;                // charge magnitude (macroparticle charge)
+    float  q2 = -1.0f;               // charge magnitude of particle 2 (< 0: same as q)
+    float  m2 = 1.0f;                // |m_q| of particle 2
 
     // Third particle (npart = 3 only). Default closes an equilateral triangle
     // with p1, p2: side 16, apex at x = 64 + 8*sqrt(3).
@@ -878,6 +951,7 @@ void test_boosted_pair( std::string param, unsigned npart = 2 ) {
         else if ( key == "n_dump"      ) { got = std::sscanf(val.c_str(),"%u",&n_dump);                  want=1; }
         else if ( key == "n_skip"      ) { got = std::sscanf(val.c_str(),"%u",&n_skip);                  want=1; }
         else if ( key == "save_part"   ) { got = std::sscanf(val.c_str(),"%u",&save_part);               want=1; }
+        else if ( key == "n_dump_part" ) { got = std::sscanf(val.c_str(),"%u",&n_dump_part);             want=1; }
         else if ( key == "p1"          ) { got = std::sscanf(val.c_str(),"%f,%f",&p1.x,&p1.y);           want=2; }
         else if ( key == "p2"          ) { got = std::sscanf(val.c_str(),"%f,%f",&p2.x,&p2.y);           want=2; }
         else if ( key == "u1"          ) { got = std::sscanf(val.c_str(),"%f,%f,%f",&u1.x,&u1.y,&u1.z);  want=3; }
@@ -888,6 +962,8 @@ void test_boosted_pair( std::string param, unsigned npart = 2 ) {
         else if ( key == "u3"          ) { got = std::sscanf(val.c_str(),"%f,%f,%f",&u3.x,&u3.y,&u3.z);  want=3; }
         else if ( key == "s3"          ) { got = std::sscanf(val.c_str(),"%f",&s3);                      want=1; }
         else if ( key == "q"           ) { got = std::sscanf(val.c_str(),"%f",&q);                       want=1; }
+        else if ( key == "q2"          ) { got = std::sscanf(val.c_str(),"%f",&q2);                      want=1; }
+        else if ( key == "m2"          ) { got = std::sscanf(val.c_str(),"%f",&m2);                      want=1; }
         else if ( key == "init"        ) { init = val; got=1;                                            want=1; }
         else if ( key == "filter"      ) { if      (val=="0"||val=="off") filter_mode="none";
                                            else if (val=="1"||val=="on" ) filter_mode="lowpass";
@@ -902,6 +978,9 @@ void test_boosted_pair( std::string param, unsigned npart = 2 ) {
     }
     if ( filter_order < 1 ) filter_order = 1;
     if ( filter_sigma <= 0 ) filter_sigma = 0.707107f;
+    if ( n_dump_part == 0 ) n_dump_part = n_dump;
+    if ( q2 < 0 ) q2 = q;
+    if ( m2 <= 0 ) { std::cerr << "m2 must be > 0\n"; std::exit(1); }
 
     float2 box = dx * make_float2( ntiles.x * nx.x, ntiles.y * nx.y );
 
@@ -918,6 +997,7 @@ void test_boosted_pair( std::string param, unsigned npart = 2 ) {
     if ( npart == 3 )
         std::cout << "p3    : " << p3 << "  u3 : " << u3 << "  s3 : " << s3 << '\n';
     std::cout << "q     : " << q  << '\n';
+    std::cout << "q2    : " << q2 << "  m2 : " << m2 << '\n';
     std::cout << "init  : " << init << ( init == "darwin" ? " (iter=" + std::to_string(darwin_iter) +
                                          ", gamma_corr=" + std::to_string(darwin_gamma_corr) + ")" : "" ) << '\n';
     std::cout << "filter: " << filter_mode << ( filter_mode == "binomial" ? " (order=" + std::to_string(filter_order) +
@@ -946,8 +1026,8 @@ void test_boosted_pair( std::string param, unsigned npart = 2 ) {
     sp1.set_density( Density::Point( q, p1 ) );
     sp1.set_udist ( UDistribution::Cold( u1 ) );
 
-    Species sp2( "part2", s2, uint2{1,1}, true );
-    sp2.set_density( Density::Point( q, p2 ) );
+    Species sp2( "part2", s2 * m2, uint2{1,1}, true );
+    sp2.set_density( Density::Point( q2, p2 ) );
     sp2.set_udist ( UDistribution::Cold( u2 ) );
 
     // Third species only constructed for npart = 3: ~Species frees np_inj, which
@@ -969,18 +1049,21 @@ void test_boosted_pair( std::string param, unsigned npart = 2 ) {
         sim.emf.save(emf::e, fcomp::x); sim.emf.save(emf::e, fcomp::y); sim.emf.save(emf::e, fcomp::z);
         sim.emf.save(emf::b, fcomp::x); sim.emf.save(emf::b, fcomp::y); sim.emf.save(emf::b, fcomp::z);
         sim.charge.save();
-        if ( save_part ) { sp1.save(); sp2.save(); if ( sp3 ) sp3 -> save(); }
         sim.energy_info();
+    };
+    auto diag_part = [&]() {
+        if ( save_part ) { sp1.save(); sp2.save(); if ( sp3 ) sp3 -> save(); }
     };
 
     Timer timer; timer.start();
-    if ( n_skip == 0 ) diag();
+    if ( n_skip == 0 ) { diag(); diag_part(); }
     while ( sim.get_t() <= tmax ) {
         sim.advance();
         if ( sim.get_iter() % 100 == 0 )
             std::cout << "iter = " << sim.get_iter() << ", t = " << sim.get_t() << '\n';
         unsigned const it = sim.get_iter();
         if ( it >= n_skip && ( it - n_skip ) % n_dump == 0 ) diag();
+        if ( it >= n_skip && ( it - n_skip ) % n_dump_part == 0 ) diag_part();
     }
     timer.stop();
     std::cout << ansi::bold << "Done!\n" << ansi::reset;
