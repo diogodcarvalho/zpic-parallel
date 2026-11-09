@@ -17,7 +17,7 @@ CFLAGS   += --gpu-architecture=compute_80
 #         udist.cpp density.cpp species.cpp cathode.cpp
 
 SOURCE = emf.cpp laser.cpp particles.cpp current.cpp charge.cpp \
-         udist.cpp density.cpp species.cpp
+         udist.cpp density.cpp species.cpp silent.cpp
 
 SOURCE += main.cpp
 
