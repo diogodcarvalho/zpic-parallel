@@ -11,6 +11,7 @@
 
 #include "species.h"
 #include <iostream>
+#include <cstring>
 
 /**
  * The following values were determined experimentally using a single
@@ -1390,6 +1391,216 @@ void Species::deposit_darwin_retarded_current( vec3grid<float3> * const J ) cons
     kernel::deposit_darwin_retarded_current <<< grid, block >>> (
         *particles, q, J->d_buffer, J->offset, J->ext_nx
     );
+}
+
+namespace kernel {
+
+__global__
+/**
+ * @brief Kernel to deposit the in-plane velocity moments of the Langmuir-silent start
+ *
+ * Number weighted (no charge factor) deposit at the particle position. Only used at
+ * t=0, so it deposits directly to global memory (as deposit_darwin_moments).
+ *
+ * @param part          Particle data
+ * @param M2_buffer     [out] ( vx^2, vx vy, vy^2 )
+ * @param M4a_buffer    [out] ( vx^4, vx^3 vy, vx^2 vy^2 )
+ * @param M4b_buffer    [out] ( vx vy^3, vy^4, 0 )
+ * @param offset        Offset to cell (0,0) in the moment tile
+ * @param ext_nx        Moment tile size (includes guard cells)
+ */
+void deposit_vmoments(
+    ParticleData const part,
+    float3 * const __restrict__ M2_buffer,
+    float3 * const __restrict__ M4a_buffer,
+    float3 * const __restrict__ M4b_buffer,
+    int const offset, uint2 const ext_nx )
+{
+    const int2 tile_idx = make_int2( blockIdx.x, blockIdx.y );
+    const int tile_id   = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const int ystride   = ext_nx.x;
+    const auto tile_vol = roundup4( ext_nx.x * ext_nx.y );
+
+    float3 * const __restrict__ M2  = & M2_buffer [ tile_id * tile_vol + offset ];
+    float3 * const __restrict__ M4a = & M4a_buffer[ tile_id * tile_vol + offset ];
+    float3 * const __restrict__ M4b = & M4b_buffer[ tile_id * tile_vol + offset ];
+
+    const int p_offset = part.offset[ tile_id ];
+    const int np       = part.np[ tile_id ];
+    int2   const * __restrict__ const ix = &part.ix[ p_offset ];
+    float2 const * __restrict__ const x  = &part.x[ p_offset ];
+    float3 const * __restrict__ const u  = &part.u[ p_offset ];
+
+    for( int i = block_thread_rank(); i < np; i += block_num_threads() ) {
+
+        // In-plane velocity
+        float3 const pu = u[i];
+        float const rg  = rgamma( pu );
+        float const vx  = pu.x * rg;
+        float const vy  = pu.y * rg;
+
+        float const vxx = vx * vx;
+        float const vxy = vx * vy;
+        float const vyy = vy * vy;
+
+        const float3 m2  = make_float3( vxx, vxy, vyy );
+        const float3 m4a = make_float3( vxx * vxx, vxx * vxy, vxx * vyy );
+        const float2 m4b = make_float2( vxy * vyy, vyy * vyy );
+
+        // Quartic Shape
+        float sx[5], sy[5];
+        // Extra offset needed for even-order shape function since they are centered
+        // with respect to nearest cell corner and not grid cell.
+        const int ix_offset = spline_s4( x[i].x, sx );
+        const int iy_offset = spline_s4( x[i].y, sy );
+
+        const int idx = ( ix[i].y + iy_offset ) * ystride + ( ix[i].x + ix_offset );
+
+        for ( int jj = -2; jj < 3; jj++ ) {
+            for ( int ii = -2; ii < 3; ii++ ) {
+                const float s = sx[ii + 2] * sy[jj + 2];
+                const int k = idx + ii + jj * ystride;
+
+                device::atomic_fetch_add( & M2[k].x,  s * m2.x );
+                device::atomic_fetch_add( & M2[k].y,  s * m2.y );
+                device::atomic_fetch_add( & M2[k].z,  s * m2.z );
+
+                device::atomic_fetch_add( & M4a[k].x, s * m4a.x );
+                device::atomic_fetch_add( & M4a[k].y, s * m4a.y );
+                device::atomic_fetch_add( & M4a[k].z, s * m4a.z );
+
+                device::atomic_fetch_add( & M4b[k].x, s * m4b.x );
+                device::atomic_fetch_add( & M4b[k].y, s * m4b.y );
+            }
+        }
+    }
+}
+
+__global__
+/**
+ * @brief Kernel to displace particles by a grid displacement field
+ *
+ * @param part          Particle data
+ * @param xi_buffer     Displacement field buffer (x, y in simulation length units)
+ * @param xi_offset     Offset to cell (0,0) in the field tile
+ * @param xi_ext_nx     Field tile size (includes guard cells)
+ * @param rdx           1 / cell size
+ * @param d_max         [out] maximum |displacement| component in cells (float bits)
+ */
+void displace(
+    ParticleData part,
+    float3 const * const __restrict__ xi_buffer,
+    int const xi_offset, uint2 const xi_ext_nx,
+    float2 const rdx, unsigned int * const __restrict__ d_max )
+{
+    const int2 tile_idx = make_int2( blockIdx.x, blockIdx.y );
+    const int tile_id   = tile_idx.y * part.ntiles.x + tile_idx.x;
+
+    const int ystride   = xi_ext_nx.x;
+    const auto tile_vol = roundup4( xi_ext_nx.x * xi_ext_nx.y );
+
+    float3 const * const __restrict__ xi = & xi_buffer[ tile_id * tile_vol + xi_offset ];
+
+    const int p_offset = part.offset[ tile_id ];
+    const int np       = part.np[ tile_id ];
+    int2   * __restrict__ ix = &part.ix[ p_offset ];
+    float2 * __restrict__ x  = &part.x[ p_offset ];
+
+    float dmax = 0;
+
+    for( int i = block_thread_rank(); i < np; i += block_num_threads() ) {
+
+        // Interpolate the displacement with the field push weights (2nd output unused)
+        float3 d, unused;
+        interpolate_fld( xi, xi, ystride, ix[i], x[i], d, unused );
+
+        const float2 delta = make_float2( d.x * rdx.x, d.y * rdx.y );
+        dmax = fmaxf( dmax, fmaxf( fabsf( delta.x ), fabsf( delta.y ) ) );
+
+        // Advance position (as kernel::move, valid for |delta| < 1 cell)
+        float2 x1 = make_float2(
+            x[i].x + delta.x,
+            x[i].y + delta.y
+        );
+
+        // Check for cell crossings
+        int2 deltai = make_int2(
+            ((x1.x >= 0.5f) - (x1.x < -0.5f)),
+            ((x1.y >= 0.5f) - (x1.y < -0.5f))
+        );
+
+        // Correct position and store
+        x1.x -= deltai.x;
+        x1.y -= deltai.y;
+        x[i] = x1;
+
+        // Modify cell and store
+        ix[i] = make_int2(
+            ix[i].x + deltai.x,
+            ix[i].y + deltai.y
+        );
+    }
+
+    // Positive floats are ordered like their bit patterns
+    device::atomic_fetch_max( d_max, __float_as_uint( dmax ) );
+}
+
+}
+
+/**
+ * @brief Deposit the in-plane velocity moments used by the Langmuir-silent start
+ *
+ * @param M2    [out] ( vx^2, vx vy, vy^2 )
+ * @param M4a   [out] ( vx^4, vx^3 vy, vx^2 vy^2 )
+ * @param M4b   [out] ( vx vy^3, vy^4, 0 )
+ */
+void Species::deposit_vmoments( vec3grid<float3> & M2, vec3grid<float3> & M4a,
+    vec3grid<float3> & M4b ) const
+{
+    dim3 grid( particles -> ntiles.x, particles -> ntiles.y );
+    auto block = 256;
+
+    kernel::deposit_vmoments <<< grid, block >>> (
+        *particles, M2.d_buffer, M4a.d_buffer, M4b.d_buffer,
+        M2.offset, M2.ext_nx
+    );
+}
+
+/**
+ * @brief Displace all particles by a grid displacement field and re-sort them
+ *
+ * @param xi        Displacement field (x, y in simulation length units)
+ * @return float    Maximum |displacement| component, in cells
+ */
+float Species::displace( vec3grid<float3> const & xi )
+{
+    device::Var<unsigned int> d_max( 0 );
+
+    dim3 grid( particles -> ntiles.x, particles -> ntiles.y );
+    auto block = 1024;
+
+    kernel::displace <<< grid, block >>> (
+        *particles, xi.d_buffer, xi.offset, xi.ext_nx,
+        make_float2( 1.0f / dx.x, 1.0f / dx.y ), d_max.ptr()
+    );
+
+    unsigned int const bits = d_max.get();
+    float max;
+    std::memcpy( &max, &bits, sizeof( float ) );
+
+    // A single cell crossing per particle is handled above
+    if ( max >= 1.0f ) {
+        ABORT( "Species::displace() displacement of " + std::to_string( max ) + " cells (must be < 1)" );
+    }
+
+    // Process physical boundary conditions
+    process_bc();
+
+    // Sort particles according to tile
+    particles -> tile_sort( *tmp, *sort );
+
+    return max;
 }
 
 namespace kernel {

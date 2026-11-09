@@ -398,6 +398,36 @@ public:
     void deposit_darwin_retarded_current( vec3grid<float3> * const J ) const;
 
     /**
+     * @brief Deposit the in-plane velocity moments used by the Langmuir-silent start
+     *
+     * Number weighted (1 per particle, no charge factor) deposit at the particle
+     * position, with v = u / gamma:
+     *
+     *  - M2  : ( vx^2, vx vy, vy^2 )
+     *  - M4a : ( vx^4, vx^3 vy, vx^2 vy^2 )
+     *  - M4b : ( vx vy^3, vy^4, 0 )
+     *
+     * @param M2    [out] second order moments
+     * @param M4a   [out] fourth order moments (first 3)
+     * @param M4b   [out] fourth order moments (last 2)
+     */
+    void deposit_vmoments( vec3grid<float3> & M2, vec3grid<float3> & M4a,
+        vec3grid<float3> & M4b ) const;
+
+    /**
+     * @brief Displace all particles by a grid displacement field
+     *
+     * The (x,y) components of the field, in simulation length units, are
+     * interpolated at the particle position with the same quartic weights used
+     * by the field push, so particles at the same position (e.g. mirror pairs)
+     * get bitwise identical displacements. Particles are re-sorted afterwards.
+     *
+     * @param xi        Displacement field (guard cells must be up to date)
+     * @return float    Maximum |displacement| component, in cells
+     */
+    float displace( vec3grid<float3> const & xi );
+
+    /**
      * @brief Accumulate this species' contribution to the boosted-Coulomb field init
      *
      * Adds, in k-space, the exact frozen field of every macroparticle treated as a
