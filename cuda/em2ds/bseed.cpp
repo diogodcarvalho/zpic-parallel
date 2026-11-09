@@ -144,6 +144,36 @@ float light_share( float const k2, float const P, float4 const m ) {
 }
 
 /**
+ * @brief murmur3 32 bit finalizer
+ */
+__host__ __device__ inline
+unsigned int fmix32( unsigned int h ) {
+    h ^= h >> 16; h *= 0x85ebca6bu;
+    h ^= h >> 13; h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+/**
+ * @brief PRNG state of one mode, decorrelated from its neighbours
+ *
+ * zrandom::rand_init offsets the state by the index, so the first outputs of
+ * neighbouring modes are nearly linear in the index. With a few draws per mode that
+ * is a linear phase ramp in k: the seed adds up to a single spike in real space
+ * (max |B| / rms ~ 80 for the fixed-amplitude seed, ~25 for the Gaussian one, against
+ * ~5 for independent phases). Hash the index instead and discard a few outputs.
+ *
+ * @param id        Mode index
+ * @param seed      RNG seed
+ * @param state     [out] PRNG state
+ */
+__host__ __device__ inline
+void mode_state( unsigned int const id, uint2 const seed, uint2 & state ) {
+    state = make_uint2( fmix32( id ^ seed.x ), fmix32( id * 0x9E3779B9u + seed.y ) );
+    for( int i = 0; i < 4; i++ ) zrandom::rand_uint32( state );
+}
+
+/**
  * @brief Relaxation rate Gamma_k and slow share A_inf of one mode (see file header)
  *
  * @param k2        |k|^2
@@ -250,8 +280,8 @@ void bseed_fields(
 
                 // Two independent complex amplitudes, < |xi|^2 > = ncells sigma^2: Gaussian,
                 // or fixed modulus with a random phase
-                uint2 state; double norm;
-                zrandom::rand_init( iyr * stride + ix, rnd_seed, state, norm );
+                uint2 state; double norm = __DBL_MAX__;   // no stored normal variate yet
+                mode_state( iyr * stride + ix, rnd_seed, state );
                 fft::complex64 xi1 = 0, xi2 = 0;
                 if ( fixed ) {
                     const float s  = sqrtf( ncells ) * sigma;
